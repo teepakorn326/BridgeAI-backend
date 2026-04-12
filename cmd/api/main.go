@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -50,6 +51,9 @@ func main() {
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: allowedOrigins,
+		AllowOriginsFunc: func(origin string) bool {
+			return strings.HasPrefix(origin, "chrome-extension://")
+		},
 		AllowHeaders: "Origin, Content-Type, Accept",
 		AllowMethods: "GET, POST, OPTIONS",
 	}))
@@ -64,6 +68,11 @@ func main() {
 
 	// API routes
 	app.Post("/api/process-course", courseHandler.ProcessCourse)
+	app.Post("/api/translate-segments", courseHandler.TranslateSegments)
+	app.Get("/api/courses", courseHandler.ListCourses)
+	app.Post("/api/summarize", courseHandler.Summarize)
+	app.Post("/api/quiz", courseHandler.GenerateQuiz)
+	app.Post("/api/vocab", courseHandler.ExtractVocab)
 
 	// Start server
 	port := os.Getenv("PORT")
