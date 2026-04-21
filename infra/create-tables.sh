@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the DynamoDB tables required by EduCaption.
+# Create the DynamoDB tables required by BridgeAI.
 #
 # Prereqs: aws CLI v2 authenticated against the target account.
 # Usage:   AWS_REGION=ap-southeast-2 ./infra/create-tables.sh

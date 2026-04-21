@@ -53,14 +53,14 @@ Creates `StudyMind_Cache` and `StudyMind_Users` (with `email-index`, `google-sub
 ## 3. Store secrets in Secrets Manager
 
 ```bash
-aws secretsmanager create-secret --name educaption/jwt-secret \
+aws secretsmanager create-secret --name bridgeai/jwt-secret \
   --secret-string "$(openssl rand -base64 48)"
 
-aws secretsmanager create-secret --name educaption/google-oauth \
+aws secretsmanager create-secret --name bridgeai/google-oauth \
   --secret-string '{"client_id":"…","client_secret":"…"}'
 
 # Optional:
-aws secretsmanager create-secret --name educaption/wechat-oauth \
+aws secretsmanager create-secret --name bridgeai/wechat-oauth \
   --secret-string '{"app_id":"…","app_secret":"…"}'
 ```
 
@@ -73,8 +73,8 @@ App Runner and ECS task definitions pull these in as environment variables at la
 Create the ECR repos once:
 
 ```bash
-aws ecr create-repository --repository-name educaption-backend    --region $AWS_REGION
-aws ecr create-repository --repository-name educaption-transcript --region $AWS_REGION
+aws ecr create-repository --repository-name bridgeai-backend    --region $AWS_REGION
+aws ecr create-repository --repository-name bridgeai-transcript --region $AWS_REGION
 
 aws ecr get-login-password --region $AWS_REGION | \
   docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
@@ -85,15 +85,15 @@ Build (`linux/amd64` to match App Runner and Fargate — important when building
 ```bash
 # Backend — from backend/ folder
 docker build --platform linux/amd64 \
-  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/educaption-backend:latest \
+  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest \
   .
-docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/educaption-backend:latest
+docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest
 
 # Transcript — from backend/ folder, pointing at sibling
 docker build --platform linux/amd64 \
-  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/educaption-transcript:latest \
+  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-transcript:latest \
   ../transcript-service
-docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/educaption-transcript:latest
+docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-transcript:latest
 ```
 
 ---
@@ -104,15 +104,15 @@ App Runner can't run the transcript service reliably: it needs FFmpeg on disk, d
 
 Rough shape — use the AWS console or CDK/Terraform:
 
-- **Cluster**: `educaption`
-- **Task definition** (`educaption-transcript`):
+- **Cluster**: `bridgeai`
+- **Task definition** (`bridgeai-transcript`):
   - CPU 1 vCPU, Memory 2 GB (2 vCPU / 4 GB if you use a larger Whisper model)
   - Container port 8081
   - Task role: `AmazonECSTaskExecutionRolePolicy`
   - No extra IAM needed (no AWS API calls from this service today)
 - **Service**:
   - 1 task, public subnets (for yt-dlp egress), security group open on 8081 from the ALB SG
-  - Behind an internal ALB with target group `educaption-transcript-tg`, health check `/health` (add a `/health` route to `main.py` if it isn't there yet)
+  - Behind an internal ALB with target group `bridgeai-transcript-tg`, health check `/health` (add a `/health` route to `main.py` if it isn't there yet)
 - Note its DNS name — that becomes `TRANSCRIPT_SERVICE_URL` for the backend.
 
 Cold-start note: the first request downloads the Whisper model (~140 MB for `base`). If you want to pre-warm, add an EFS volume mounted at `/app/.cache` so the model persists across task restarts.
@@ -123,7 +123,7 @@ Cold-start note: the first request downloads the Whisper model (~140 MB for `bas
 
 Console → App Runner → Create service:
 
-- **Source**: ECR → `educaption-backend:latest`
+- **Source**: ECR → `bridgeai-backend:latest`
 - **Port**: 8080
 - **Instance role**: custom role with
   - `AmazonDynamoDBFullAccess` (scope tighter later: just the two tables)
@@ -139,8 +139,8 @@ Console → App Runner → Create service:
   | `CORS_ORIGINS` | `https://your-frontend.vercel.app` |
   | `FRONTEND_URL` | `https://your-frontend.vercel.app` |
   | `TRANSCRIPT_SERVICE_URL` | `http://<transcript-alb-dns>` |
-  | `JWT_SECRET` | pulled from secret `educaption/jwt-secret` |
-  | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | from secret `educaption/google-oauth` |
+  | `JWT_SECRET` | pulled from secret `bridgeai/jwt-secret` |
+  | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | from secret `bridgeai/google-oauth` |
   | `GOOGLE_REDIRECT_URL` | `https://<apprunner-domain>/auth/google/callback` |
 
 - **Health check**: `/api/health`
@@ -174,7 +174,7 @@ docker run --rm \
   -e SEED_EMAIL=bosskero326@gmail.com \
   -e SEED_PASSWORD='<strong>' \
   --entrypoint /app/seed \
-  ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/educaption-backend:latest
+  ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest
 ```
 
 Re-running the seeder updates the password in place — safe to use for rotations.
