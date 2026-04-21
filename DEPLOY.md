@@ -2,6 +2,8 @@
 
 **Run commands from this folder (`backend/`)** unless noted. The frontend and transcript-service live in sibling folders (`../frontend/`, `../transcript-service/`) as independent repos (separate GitHub remotes).
 
+> **Note on resource names.** A prior deploy attempt created resources under the old project name `educaption/*` / `educaption-*` (the JWT secret in Secrets Manager and two empty ECR repositories). The commands below use the new name `bridgeai/*` / `bridgeai-*`. Either reuse the existing `educaption-*` resources (substitute names in the commands) or delete them first. Reference: `educaption/jwt-secret`, `educaption-backend`, `educaption-transcript`.
+
 Target: one production stack for the WSTI Hackathon demo.
 
 - **Frontend** → Vercel
