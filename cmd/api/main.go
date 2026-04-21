@@ -35,8 +35,9 @@ func main() {
 	// Initialize transcript client
 	transcript := services.NewTranscriptClient()
 
-	// Create handler with dependencies
+	// Create handlers with dependencies
 	courseHandler := handlers.NewCourseHandler(cache, bedrock, transcript)
+	authHandler := handlers.NewAuthHandler(cache)
 
 	// Initialize Fiber
 	app := fiber.New(fiber.Config{
@@ -54,8 +55,9 @@ func main() {
 		AllowOriginsFunc: func(origin string) bool {
 			return strings.HasPrefix(origin, "chrome-extension://")
 		},
-		AllowHeaders: "Origin, Content-Type, Accept",
-		AllowMethods: "GET, POST, OPTIONS",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowMethods:     "GET, POST, OPTIONS",
+		AllowCredentials: true,
 	}))
 
 	// Health check
@@ -66,13 +68,28 @@ func main() {
 		})
 	})
 
-	// API routes
-	app.Post("/api/process-course", courseHandler.ProcessCourse)
-	app.Post("/api/translate-segments", courseHandler.TranslateSegments)
-	app.Get("/api/courses", courseHandler.ListCourses)
-	app.Post("/api/summarize", courseHandler.Summarize)
-	app.Post("/api/quiz", courseHandler.GenerateQuiz)
-	app.Post("/api/vocab", courseHandler.ExtractVocab)
+	// Auth routes
+	app.Post("/auth/register", authHandler.Register)
+	app.Post("/auth/login", authHandler.Login)
+	app.Post("/auth/logout", authHandler.Logout)
+	app.Get("/auth/google", authHandler.GoogleRedirect)
+	app.Get("/auth/google/callback", authHandler.GoogleCallback)
+	app.Get("/auth/wechat", authHandler.WechatRedirect)
+	app.Get("/auth/wechat/callback", authHandler.WechatCallback)
+	app.Get("/auth/me", authHandler.RequireAuth, authHandler.GetMe)
+	app.Post("/auth/extension-token", authHandler.RequireAuth, authHandler.ExtensionToken)
+
+	// API routes (auth required)
+	api := app.Group("/api", authHandler.RequireAuth)
+	api.Post("/process-course", courseHandler.ProcessCourse)
+	api.Post("/ingest-course", courseHandler.IngestCourse)
+	api.Get("/course", courseHandler.GetCourse)
+	api.Post("/translate-segments", courseHandler.TranslateSegments)
+	api.Get("/courses", courseHandler.ListCourses)
+	api.Post("/summarize", courseHandler.Summarize)
+	api.Post("/quiz", courseHandler.GenerateQuiz)
+	api.Post("/vocab", courseHandler.ExtractVocab)
+	api.Post("/chat", courseHandler.Chat)
 
 	// Start server
 	port := os.Getenv("PORT")

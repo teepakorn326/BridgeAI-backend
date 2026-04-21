@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -290,11 +291,252 @@ func (h *CourseHandler) TranslateSegments(c *fiber.Ctx) error {
 	return c.JSON(models.TranslateSegmentsResponse{Segments: out})
 }
 
-// extractVideoID attempts to parse a YouTube video ID from a URL.
+// IngestCourse handles POST /api/ingest-course — called by the Chrome
+// extension after a transcript is captured from Udemy / Coursera / Echo360.
+// Translates, caches, and kicks off summary/quiz/vocab generation in the
+// background so they're ready by the time the user opens the course page.
+func (h *CourseHandler) IngestCourse(c *fiber.Ctx) error {
+	var req models.IngestRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.SourceURL == "" || req.TargetLang == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "source_url and target_lang are required",
+		})
+	}
+	if len(req.Subtitles) == 0 && len(req.Segments) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "segments or subtitles are required",
+		})
+	}
+
+	videoID := extractVideoID(req.SourceURL)
+	log.Printf("[Handler] Ingest source=%s id=%s lang=%s segments=%d subtitles=%d",
+		req.Source, videoID, req.TargetLang, len(req.Segments), len(req.Subtitles))
+
+	if cached, _ := h.cache.GetCachedCourse(videoID, req.TargetLang); cached != nil {
+		log.Printf("[Handler] Ingest cache HIT — returning existing")
+		return c.JSON(cached)
+	}
+
+	// Build English segments for study-material generation.
+	var segs []services.TranscriptSegment
+	var subtitles []models.SubtitleLine
+
+	if len(req.Subtitles) > 0 {
+		// Pre-translated from the extension — skip Bedrock translation.
+		log.Printf("[Handler] Using %d pre-translated subtitles (skipping translation)", len(req.Subtitles))
+		subtitles = req.Subtitles
+		segs = make([]services.TranscriptSegment, len(req.Subtitles))
+		for i, s := range req.Subtitles {
+			segs[i] = services.TranscriptSegment{
+				StartSeconds: s.StartSeconds,
+				EndSeconds:   s.EndSeconds,
+				Text:         s.TextEN,
+			}
+		}
+	} else {
+		// Raw segments — translate via Bedrock.
+		segs = make([]services.TranscriptSegment, len(req.Segments))
+		for i, s := range req.Segments {
+			segs[i] = services.TranscriptSegment{
+				StartSeconds: s.Start,
+				EndSeconds:   s.End,
+				Text:         s.Text,
+			}
+		}
+		var err error
+		subtitles, err = h.bedrock.TranslateSegments(segs, req.TargetLang)
+		if err != nil {
+			log.Printf("[Handler] Ingest translation error: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "translation failed"})
+		}
+	}
+
+	title := req.Title
+	if title == "" {
+		title = fmt.Sprintf("%s lecture", req.Source)
+	}
+
+	response := &models.ProcessResponse{
+		VideoID:    videoID,
+		VideoURL:   req.SourceURL,
+		Source:     req.Source,
+		TargetLang: req.TargetLang,
+		Title:      title,
+		Subtitles:  subtitles,
+		FromCache:  false,
+	}
+
+	if err := h.cache.SaveToCache(videoID, req.TargetLang, response); err != nil {
+		log.Printf("[Handler] Ingest cache save error: %v", err)
+	}
+
+	// Kick off study-material generation in the background.
+	go h.generateStudyMaterials(videoID, req.TargetLang, segs)
+
+	log.Printf("[Handler] Ingest complete: %d subtitles", len(subtitles))
+	return c.JSON(response)
+}
+
+// generateStudyMaterials runs Summarize, GenerateQuiz, and ExtractVocab
+// in parallel and writes each to the DynamoDB cache. Used by IngestCourse.
+func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs []services.TranscriptSegment) {
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		summary, err := h.bedrock.Summarize(segs, targetLang)
+		if err != nil {
+			log.Printf("[Handler] auto-summary error: %v", err)
+			return
+		}
+		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "summary", summary); err != nil {
+			log.Printf("[Handler] auto-summary cache error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		quiz, err := h.bedrock.GenerateQuiz(segs, targetLang)
+		if err != nil {
+			log.Printf("[Handler] auto-quiz error: %v", err)
+			return
+		}
+		raw, _ := json.Marshal(quiz)
+		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "quiz", string(raw)); err != nil {
+			log.Printf("[Handler] auto-quiz cache error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		vocab, err := h.bedrock.ExtractVocab(segs, targetLang)
+		if err != nil {
+			log.Printf("[Handler] auto-vocab error: %v", err)
+			return
+		}
+		raw, _ := json.Marshal(vocab)
+		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "vocab", string(raw)); err != nil {
+			log.Printf("[Handler] auto-vocab cache error: %v", err)
+		}
+	}()
+
+	wg.Wait()
+	log.Printf("[Handler] Study materials generated for %s/%s", videoID, targetLang)
+}
+
+// GetCourse handles GET /api/course?id=...&lang=... (or ?url=...&lang=...).
+// Returns a cached course without triggering any transcript fetch or translation.
+func (h *CourseHandler) GetCourse(c *fiber.Ctx) error {
+	videoID := c.Query("id")
+	if videoID == "" {
+		videoURL := c.Query("url")
+		if videoURL != "" {
+			videoID = extractVideoID(videoURL)
+		}
+	}
+	targetLang := c.Query("lang")
+	if videoID == "" || targetLang == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or url, and lang required"})
+	}
+	cached, err := h.cache.GetCachedCourse(videoID, targetLang)
+	if err != nil {
+		log.Printf("[Handler] GetCourse cache error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cache error"})
+	}
+	if cached == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "course not found — capture it with the extension first"})
+	}
+
+	// Backfill study materials for older courses cached before the
+	// auto-generation pipeline existed. Fire-and-forget — the UI still
+	// gets the translated course immediately.
+	go h.ensureStudyMaterials(videoID, targetLang, cached.Subtitles)
+
+	return c.JSON(cached)
+}
+
+// ensureStudyMaterials triggers background generation for any of
+// summary/quiz/vocab that aren't already cached. Safe to call on every
+// GetCourse — skips quickly if all three exist.
+func (h *CourseHandler) ensureStudyMaterials(videoID, targetLang string, subtitles []models.SubtitleLine) {
+	summary, _ := h.cache.GetStudyMaterial(videoID, targetLang, "summary")
+	quiz, _ := h.cache.GetStudyMaterial(videoID, targetLang, "quiz")
+	vocab, _ := h.cache.GetStudyMaterial(videoID, targetLang, "vocab")
+	if summary != "" && quiz != "" && vocab != "" {
+		return
+	}
+
+	segs := make([]services.TranscriptSegment, len(subtitles))
+	for i, s := range subtitles {
+		segs[i] = services.TranscriptSegment{
+			StartSeconds: s.StartSeconds,
+			EndSeconds:   s.EndSeconds,
+			Text:         s.TextEN,
+		}
+	}
+
+	log.Printf("[Handler] Backfilling study materials for %s/%s (summary=%v quiz=%v vocab=%v)",
+		videoID, targetLang, summary == "", quiz == "", vocab == "")
+	h.generateStudyMaterials(videoID, targetLang, segs)
+}
+
+// Chat handles POST /api/chat — answer a question about a cached transcript.
+func (h *CourseHandler) Chat(c *fiber.Ctx) error {
+	var req models.ChatRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.TargetLang == "" || len(req.Messages) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "target_lang and messages required"})
+	}
+
+	videoID := req.VideoID
+	if videoID == "" && req.VideoURL != "" {
+		videoID = extractVideoID(req.VideoURL)
+	}
+	if videoID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "video_id or video_url required"})
+	}
+
+	cached, err := h.cache.GetCachedCourse(videoID, req.TargetLang)
+	if err != nil || cached == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "course not found"})
+	}
+
+	segs := make([]services.TranscriptSegment, len(cached.Subtitles))
+	for i, s := range cached.Subtitles {
+		segs[i] = services.TranscriptSegment{
+			StartSeconds: s.StartSeconds,
+			EndSeconds:   s.EndSeconds,
+			Text:         s.TextEN,
+		}
+	}
+
+	history := make([]services.ChatMessage, len(req.Messages))
+	for i, m := range req.Messages {
+		history[i] = services.ChatMessage{Role: m.Role, Content: m.Content}
+	}
+
+	answer, err := h.bedrock.ChatWithTranscript(segs, req.TargetLang, history)
+	if err != nil {
+		log.Printf("[Handler] Chat error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "chat failed"})
+	}
+
+	return c.JSON(fiber.Map{"answer": answer})
+}
+
+// extractVideoID returns a stable cache key from a video URL.
+// For YouTube: extracts the v= parameter.
+// For other platforms: uses host + path (stripped of query params and
+// fragments so the same lecture from different browsers gets the same key).
 func extractVideoID(videoURL string) string {
 	parsed, err := url.Parse(videoURL)
 	if err != nil {
-		// fallback: use the whole URL as an ID
 		return strings.ReplaceAll(videoURL, "/", "_")
 	}
 
@@ -316,7 +558,12 @@ func extractVideoID(videoURL string) string {
 		}
 	}
 
-	return strings.ReplaceAll(videoURL, "/", "_")
+	// Non-YouTube: use host + path only (ignore query params, fragments,
+	// session tokens) so the same lecture from different browsers or
+	// sessions produces the same cache key.
+	stable := parsed.Host + parsed.Path
+	stable = strings.TrimRight(stable, "/")
+	return strings.ReplaceAll(stable, "/", "_")
 }
 
 // ProcessCourse handles POST /api/process-course.

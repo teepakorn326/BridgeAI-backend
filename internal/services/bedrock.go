@@ -150,16 +150,21 @@ func (b *BedrockService) translateChunk(segments []TranscriptSegment, targetLang
 		fmt.Fprintf(&numberedInput, "[%d] %s\n", i+1, seg.Text)
 	}
 
-	systemPrompt := fmt.Sprintf(`You are professional education translator in %s, Translate each numbered line into %s.
-Return a JSON array of EXACTLY %d strings, one translation per line, in the same order.
-Line [1] -> array index 0, line [2] -> array index 1, etc.
+	systemPrompt := fmt.Sprintf(`You are a professional educational translator. Your job is to translate English lecture subtitles into natural, fluent %s for university students.
 
-CRITICAL RULES:
-- Output array MUST have EXACTLY %d elements
-- Do NOT merge lines. Do NOT skip lines. Each numbered line = one array element.
-- Even if a line is short (one word), it still gets its own translation.
-- Keep technical terms in English (machine learning, deep learning, neural network, algorithm, etc.)
-- Return ONLY the JSON array. No markdown. No explanation.`, targetLang, targetLang, len(segments), len(segments))
+TASK: Translate each numbered line into %s.
+OUTPUT: a JSON array of EXACTLY %d strings, one translation per numbered line, in order.
+
+ABSOLUTE RULES (violations will be rejected):
+1. Every output string MUST be written in %s. Do NOT return the English input unchanged.
+2. Translate everyday English naturally into %s. However, KEEP domain-specific technical terms in English — these are specialized terms that university students and professionals in the field commonly use in English even when speaking %s. This applies to ALL academic fields (science, engineering, medicine, business, law, etc.), not just IT.
+3. Also keep in English: acronyms, abbreviations, product/brand names, code identifiers, mathematical symbols, and proper nouns.
+4. The translation must sound natural to a %s-speaking university student — mix %s grammar with English technical terms as they would in a real classroom or textbook.
+5. Output array MUST have EXACTLY %d elements. Do NOT merge, skip, or split lines. Line [1] -> index 0, line [2] -> index 1, etc. One numbered line = one array element, even if it is only one word.
+6. Return ONLY the raw JSON array. No markdown fences. No commentary. No preamble.
+
+If a line is a single technical term, acronym, or number, keep it as-is. Otherwise translate the non-technical parts.`,
+		targetLang, targetLang, len(segments), targetLang, targetLang, targetLang, targetLang, targetLang, len(segments))
 
 	reqBody := claudeRequest{
 		AnthropicVersion: "bedrock-2023-05-31",
@@ -294,6 +299,67 @@ func (b *BedrockService) invokeClaude(systemPrompt, userMessage string, maxToken
 		return resp.Content[0].Text, nil
 	}
 	return "", fmt.Errorf("invokeClaude failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// ChatMessage is a single turn in a conversation.
+type ChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ChatWithTranscript answers a question about a lecture transcript in the
+// target language, preserving conversation history.
+func (b *BedrockService) ChatWithTranscript(segments []TranscriptSegment, targetLang string, history []ChatMessage) (string, error) {
+	transcript := joinSegments(segments)
+	system := fmt.Sprintf(`You are a helpful study assistant for a university student.
+The student is studying a lecture. Answer their questions IN %s, grounded strictly in the transcript below.
+Keep English technical terms (API, GPU, ReLU, CNN, SQL, etc.) in English.
+If the transcript does not contain the answer, say so honestly IN %s — do not invent facts.
+Be concise, friendly, and explain concepts clearly at undergraduate level.
+
+LECTURE TRANSCRIPT:
+%s`, targetLang, targetLang, transcript)
+
+	msgs := make([]claudeMessage, 0, len(history))
+	for _, m := range history {
+		role := m.Role
+		if role != "user" && role != "assistant" {
+			role = "user"
+		}
+		msgs = append(msgs, claudeMessage{Role: role, Content: m.Content})
+	}
+	if len(msgs) == 0 || msgs[len(msgs)-1].Role != "user" {
+		return "", fmt.Errorf("chat history must end with a user message")
+	}
+
+	reqBody := claudeRequest{
+		AnthropicVersion: "bedrock-2023-05-31",
+		MaxTokens:        1024,
+		System:           system,
+		Messages:         msgs,
+	}
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal chat request: %w", err)
+	}
+
+	result, err := b.client.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
+		ModelId:     stringPtr(bedrockModel),
+		ContentType: stringPtr("application/json"),
+		Body:        reqBytes,
+	})
+	if err != nil {
+		return "", fmt.Errorf("bedrock chat error: %w", err)
+	}
+
+	var resp claudeResponse
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		return "", fmt.Errorf("unmarshal chat response: %w", err)
+	}
+	if len(resp.Content) == 0 {
+		return "", fmt.Errorf("bedrock returned empty chat content")
+	}
+	return resp.Content[0].Text, nil
 }
 
 // joinSegments concatenates segment texts into a single transcript string.

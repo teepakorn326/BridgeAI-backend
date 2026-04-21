@@ -61,10 +61,36 @@ type VocabEntry struct {
 	Definition  string `json:"definition"`
 }
 
+// ChatTurn is a single message in a chat conversation.
+type ChatTurn struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ChatRequest asks the study assistant about a cached course transcript.
+type ChatRequest struct {
+	VideoURL   string     `json:"video_url"`
+	VideoID    string     `json:"video_id"`
+	TargetLang string     `json:"target_lang"`
+	Messages   []ChatTurn `json:"messages"`
+}
+
+// IngestRequest is sent by the Chrome extension after capturing a transcript.
+// If Subtitles is provided (pre-translated), translation is skipped.
+type IngestRequest struct {
+	Source     string         `json:"source"`
+	SourceURL  string         `json:"source_url"`
+	Title      string         `json:"title"`
+	TargetLang string         `json:"target_lang"`
+	Segments   []SegmentInput `json:"segments"`
+	Subtitles  []SubtitleLine `json:"subtitles,omitempty"`
+}
+
 // ProcessResponse is the full response sent back to the frontend.
 type ProcessResponse struct {
 	VideoID    string         `json:"video_id"`
 	VideoURL   string         `json:"video_url"`
+	Source     string         `json:"source,omitempty"`
 	TargetLang string         `json:"target_lang"`
 	Title      string         `json:"title"`
 	Subtitles  []SubtitleLine `json:"subtitles"`
