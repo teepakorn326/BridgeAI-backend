@@ -84,26 +84,39 @@ func NewAuthHandler(db *database.CacheService) *AuthHandler {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+// cookieAttrs picks SameSite + Secure based on APP_ENV.
+// Production (Vercel frontend + Render backend are cross-site) requires
+// SameSite=None + Secure=true or the browser drops the cookie on fetch().
+// Local dev keeps Lax to avoid the HTTPS requirement.
+func cookieAttrs() (sameSite string, secure bool) {
+	if os.Getenv("APP_ENV") == "production" {
+		return "None", true
+	}
+	return "Lax", false
+}
+
 func (h *AuthHandler) setJWTCookie(c *fiber.Ctx, token string) {
+	sameSite, secure := cookieAttrs()
 	c.Cookie(&fiber.Cookie{
 		Name:     "jwt",
 		Value:    token,
 		Expires:  time.Now().Add(7 * 24 * time.Hour),
 		HTTPOnly: true,
-		Secure:   os.Getenv("APP_ENV") == "production",
-		SameSite: "Lax",
+		Secure:   secure,
+		SameSite: sameSite,
 		Path:     "/",
 	})
 }
 
 func (h *AuthHandler) clearJWTCookie(c *fiber.Ctx) {
+	sameSite, secure := cookieAttrs()
 	c.Cookie(&fiber.Cookie{
 		Name:     "jwt",
 		Value:    "",
 		Expires:  time.Now().Add(-1 * time.Hour),
 		HTTPOnly: true,
-		Secure:   os.Getenv("APP_ENV") == "production",
-		SameSite: "Lax",
+		Secure:   secure,
+		SameSite: sameSite,
 		Path:     "/",
 	})
 }
@@ -125,15 +138,18 @@ func (h *AuthHandler) generateCSRFState(c *fiber.Ctx, next string) string {
 	rand.Read(b)
 	state := base64.URLEncoding.EncodeToString(b)
 
-	// Store state and next URL in an HttpOnly cookie for verification
+	// Store state and next URL in an HttpOnly cookie for verification.
+	// OAuth's redirect flow is a top-level navigation, so Lax is fine here —
+	// but we mirror the JWT cookie's attrs so prod still gets Secure=true.
+	sameSite, secure := cookieAttrs()
 	cookieVal := fmt.Sprintf("%s|%s", state, next)
 	c.Cookie(&fiber.Cookie{
 		Name:     "oauth_state",
 		Value:    cookieVal,
 		Expires:  time.Now().Add(15 * time.Minute),
 		HTTPOnly: true,
-		Secure:   os.Getenv("APP_ENV") == "production", // Must be true in prod
-		SameSite: "Lax",
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 	return state
 }

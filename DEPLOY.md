@@ -1,228 +1,173 @@
-# Deployment Guide
+# Deployment Guide — Vercel + Render
 
-**Run commands from this folder (`backend/`)** unless noted. The frontend and transcript-service live in sibling folders (`../frontend/`, `../transcript-service/`) as independent repos (separate GitHub remotes).
+Target stack for the WSTI Hackathon demo and Grand Finale community vote.
 
-> **Note on resource names.** A prior deploy attempt created resources under the old project name `educaption/*` / `educaption-*` (the JWT secret in Secrets Manager and two empty ECR repositories). The commands below use the new name `bridgeai/*` / `bridgeai-*`. Either reuse the existing `educaption-*` resources (substitute names in the commands) or delete them first. Reference: `educaption/jwt-secret`, `educaption-backend`, `educaption-transcript`.
+| Service | Host | Why |
+|---|---|---|
+| Frontend (Next.js 14) | **Vercel** (Hobby, free) | zero-config Next.js, global CDN |
+| Backend (Go / Fiber) | **Render** Web Service, Docker | always-on $7/mo plan avoids cold starts |
+| Transcript service (FastAPI + Whisper) | **Render** Web Service, Docker | 2 GB RAM tier fits faster-whisper + ffmpeg |
+| DynamoDB | **AWS** `ap-southeast-2` | cheap, pay-per-request |
+| Bedrock (Claude Sonnet 4) | **AWS** `ap-southeast-2` | inference profile `apac.anthropic.claude-sonnet-4-20250514-v1:0` hardcoded in `internal/services/bedrock.go` |
 
-Target: one production stack for the WSTI Hackathon demo.
-
-- **Frontend** → Vercel
-- **Backend (Go / Fiber)** → AWS App Runner
-- **Transcript service (Python / FFmpeg / Whisper)** → AWS ECS Fargate behind an ALB
-- **DynamoDB** → existing AWS account, tables created via `infra/create-tables.sh`
-- **Secrets** → AWS Secrets Manager, wired into each service's runtime env
-
-The primary account for the demo is `bosskero326@gmail.com` and is pre-seeded by `backend/cmd/seed`.
+The demo account `bosskero326@gmail.com` is pre-seeded by `backend/cmd/seed` — see §6.
 
 ---
 
 ## 0. One-time prerequisites
 
-- AWS CLI v2 authenticated against the target account (`aws sts get-caller-identity`)
-- Docker running locally
-- A region chosen — commands below assume `ap-southeast-2`. Bedrock cross-region inference profile `apac.anthropic.claude-sonnet-4-20250514-v1:0` is hardcoded in `backend/internal/services/bedrock.go`; pick a region in the apac profile.
-- Bedrock model access approved for Claude Sonnet 4 in the chosen region.
+### 0.1 AWS resources
+
+Create these once, then leave them alone.
 
 ```bash
 export AWS_REGION=ap-southeast-2
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# DynamoDB tables + GSIs. Idempotent — safe to re-run.
+bash backend/infra/create-tables.sh
+
+# IAM user that Render will impersonate. Keep the access key + secret;
+# you'll paste them into Render env vars in §3.
+aws iam create-user --user-name bridgeai-render
+aws iam attach-user-policy --user-name bridgeai-render \
+    --policy-arn arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+aws iam attach-user-policy --user-name bridgeai-render \
+    --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+aws iam create-access-key --user-name bridgeai-render
+# → copy AccessKeyId and SecretAccessKey
 ```
 
----
+**Bedrock model access.** In the AWS console (`ap-southeast-2` → Bedrock → Model access), enable access to *Claude Sonnet 4* before the first call. Without this, translation returns `AccessDeniedException`.
 
-## 1. Rotate the exposed secrets
+### 0.2 Google OAuth client
 
-The repo previously had real OAuth + JWT values in `backend/.env` on disk. Rotate before anything ships:
+Google Cloud console → APIs & Services → Credentials → OAuth 2.0 Client IDs → Web application.
 
-- Google Cloud Console → OAuth 2.0 Client → "Reset secret" for the OAuth client.
-- Generate a new JWT secret: `openssl rand -base64 48`
-- (WeChat if used) regenerate in the WeChat Open Platform.
+- **Authorized redirect URI**: `https://bridgeai-backend.onrender.com/auth/google/callback` (adjust if you rename the Render service).
+- Keep the client ID and secret; you'll paste them into Render env vars in §3.
 
-Do **not** copy new values back into a committed file. They belong in Secrets Manager.
+### 0.3 Chrome extension config
 
----
+Edit [`chrome-extension/config.js`](../chrome-extension/config.js) with your production URLs:
 
-## 2. Create DynamoDB tables
-
-```bash
-./infra/create-tables.sh   # from backend/
+```js
+self.BRIDGE_CONFIG = {
+  DEFAULT_API_BASE: 'https://bridgeai-backend.onrender.com',
+  DEFAULT_WEB_URL:  'https://bridgeai.vercel.app',
+};
 ```
 
-Creates `StudyMind_Cache` and `StudyMind_Users` (with `email-index`, `google-sub-index`, `wechat-openid-index` GSIs), both pay-per-request. Idempotent — safe to re-run.
+Dev overrides live in `config.local.js` (gitignored).
 
 ---
 
-## 3. Store secrets in Secrets Manager
+## 1. Deploy Render services via Blueprint
+
+The repo ships with a [`render.yaml`](../render.yaml) at the root that declares both services.
+
+1. Render dashboard → **New +** → **Blueprint**.
+2. Connect the GitHub repo.
+3. Render detects `render.yaml`, previews two services (`bridgeai-backend`, `bridgeai-transcript`), and provisions them.
+4. Open each service → **Environment** tab → fill the secrets marked `sync: false` (the blueprint deliberately leaves them blank so they can't leak into git):
+
+### 1.1 `bridgeai-backend` secrets to paste
+
+| Key | Value |
+|---|---|
+| `FRONTEND_URL` | leave for now, fill after §2 |
+| `CORS_ORIGINS` | leave for now, fill after §2 |
+| `AWS_ACCESS_KEY_ID` | from §0.1 |
+| `AWS_SECRET_ACCESS_KEY` | from §0.1 |
+| `GOOGLE_CLIENT_ID` | from §0.2 |
+| `GOOGLE_CLIENT_SECRET` | from §0.2 |
+| `GOOGLE_REDIRECT_URL` | `https://bridgeai-backend.onrender.com/auth/google/callback` |
+| `WECHAT_APP_ID` / `WECHAT_APP_SECRET` / `WECHAT_REDIRECT_URL` | only if using WeChat, else leave blank |
+
+`JWT_SECRET` is auto-generated by the blueprint (`generateValue: true`). `TRANSCRIPT_SERVICE_URL` is pre-wired to the other service's internal hostname.
+
+The backend won't start cleanly until `FRONTEND_URL` and `CORS_ORIGINS` are set — come back to this after §2.
+
+### 1.2 `bridgeai-transcript` — no secrets required
+
+All values in the blueprint are non-sensitive. The persistent disk at `/app/.cache` keeps the Whisper model across cold starts.
+
+---
+
+## 2. Deploy frontend to Vercel
+
+1. Vercel dashboard → **Add New…** → **Project** → import the same GitHub repo.
+2. **Root directory**: `frontend`. Framework preset: Next.js.
+3. Environment variables:
+
+| Key | Value |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | `https://bridgeai-backend.onrender.com` |
+| `NEXT_PUBLIC_SITE_URL` | your Vercel URL (or custom domain) |
+
+4. Deploy. Note the final URL (e.g. `https://bridgeai.vercel.app`).
+5. Back in Render, fill the two deferred values on `bridgeai-backend`:
+   - `FRONTEND_URL` = your Vercel URL
+   - `CORS_ORIGINS` = same value (comma-separated if you want to allow `http://localhost:3000` too for dev)
+6. Redeploy the backend service.
+
+---
+
+## 3. Cross-site auth — sanity checks
+
+Vercel and Render are different registrable domains, so:
+
+- The backend sets `SameSite=None; Secure=true` when `APP_ENV=production` — handled automatically by [`cookieAttrs()`](internal/handlers/auth_handler.go).
+- The frontend uses `credentials: 'include'` on every fetch — already the case in [`lib/auth.tsx`](../frontend/src/lib/auth.tsx).
+- CORS on the backend allows the Vercel origin + any `chrome-extension://…` (for the extension bridge) — see [`cmd/api/main.go`](cmd/api/main.go).
+
+If login silently fails, open DevTools → Application → Cookies. You should see `jwt` with `SameSite=None`, `Secure=true`, `Domain=.onrender.com`. If not, the backend wasn't redeployed after setting `APP_ENV=production`.
+
+---
+
+## 4. Seed the demo account
+
+The `cmd/seed` binary upserts a user in DynamoDB. It reads `SEED_EMAIL` / `SEED_PASSWORD` and is idempotent — re-running rotates the password.
+
+Easiest path on Render: use the **Shell** tab on `bridgeai-backend`:
 
 ```bash
-aws secretsmanager create-secret --name bridgeai/jwt-secret \
-  --secret-string "$(openssl rand -base64 48)"
-
-aws secretsmanager create-secret --name bridgeai/google-oauth \
-  --secret-string '{"client_id":"…","client_secret":"…"}'
-
-# Optional:
-aws secretsmanager create-secret --name bridgeai/wechat-oauth \
-  --secret-string '{"app_id":"…","app_secret":"…"}'
+SEED_EMAIL=bosskero326@gmail.com SEED_PASSWORD='<pick-a-demo-password>' /app/seed
 ```
 
-App Runner and ECS task definitions pull these in as environment variables at launch (see sections 5 and 6).
+(`/app/seed` ships in the Docker image alongside `/app/api` — see `backend/Dockerfile`.)
 
----
-
-## 4. Build and push the two images
-
-Create the ECR repos once:
+Alternatively, run locally with `aws` creds and the same env:
 
 ```bash
-aws ecr create-repository --repository-name bridgeai-backend    --region $AWS_REGION
-aws ecr create-repository --repository-name bridgeai-transcript --region $AWS_REGION
-
-aws ecr get-login-password --region $AWS_REGION | \
-  docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-```
-
-Build (`linux/amd64` to match App Runner and Fargate — important when building on an Apple Silicon Mac):
-
-```bash
-# Backend — from backend/ folder
-docker build --platform linux/amd64 \
-  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest \
-  .
-docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest
-
-# Transcript — from backend/ folder, pointing at sibling
-docker build --platform linux/amd64 \
-  -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-transcript:latest \
-  ../transcript-service
-docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-transcript:latest
-```
-
----
-
-## 5. Deploy the transcript service (ECS Fargate)
-
-App Runner can't run the transcript service reliably: it needs FFmpeg on disk, does long downloads with yt-dlp, and Whisper's first cold model load is slow. Fargate is the right fit.
-
-Rough shape — use the AWS console or CDK/Terraform:
-
-- **Cluster**: `bridgeai`
-- **Task definition** (`bridgeai-transcript`):
-  - CPU 1 vCPU, Memory 2 GB (2 vCPU / 4 GB if you use a larger Whisper model)
-  - Container port 8081
-  - Task role: `AmazonECSTaskExecutionRolePolicy`
-  - No extra IAM needed (no AWS API calls from this service today)
-- **Service**:
-  - 1 task, public subnets (for yt-dlp egress), security group open on 8081 from the ALB SG
-  - Behind an internal ALB with target group `bridgeai-transcript-tg`, health check `/health` (add a `/health` route to `main.py` if it isn't there yet)
-- Note its DNS name — that becomes `TRANSCRIPT_SERVICE_URL` for the backend.
-
-Cold-start note: the first request downloads the Whisper model (~140 MB for `base`). If you want to pre-warm, add an EFS volume mounted at `/app/.cache` so the model persists across task restarts.
-
----
-
-## 6. Deploy the backend (App Runner)
-
-Console → App Runner → Create service:
-
-- **Source**: ECR → `bridgeai-backend:latest`
-- **Port**: 8080
-- **Instance role**: custom role with
-  - `AmazonDynamoDBFullAccess` (scope tighter later: just the two tables)
-  - `AmazonBedrockFullAccess` (scope tighter later: just `InvokeModel` on the Claude Sonnet model)
-  - `secretsmanager:GetSecretValue` on the three secrets above
-- **Environment**:
-
-  | Key | Value |
-  |---|---|
-  | `APP_ENV` | `production` |
-  | `AWS_REGION` | `ap-southeast-2` |
-  | `PORT` | `8080` |
-  | `CORS_ORIGINS` | `https://your-frontend.vercel.app` |
-  | `FRONTEND_URL` | `https://your-frontend.vercel.app` |
-  | `TRANSCRIPT_SERVICE_URL` | `http://<transcript-alb-dns>` |
-  | `JWT_SECRET` | pulled from secret `bridgeai/jwt-secret` |
-  | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | from secret `bridgeai/google-oauth` |
-  | `GOOGLE_REDIRECT_URL` | `https://<apprunner-domain>/auth/google/callback` |
-
-- **Health check**: `/api/health`
-
-App Runner hands you a `*.awsapprunner.com` URL. That's the backend base.
-
-Update Google OAuth console to whitelist the new `GOOGLE_REDIRECT_URL`.
-
----
-
-## 7. Seed the demo account
-
-After the backend is live and tables exist, run the seeder once. Easiest path: exec into an App Runner instance is not supported, so run locally with your AWS creds pointed at the same account:
-
-```bash
-# from backend/
-export AWS_REGION=ap-southeast-2
-export SEED_EMAIL=bosskero326@gmail.com
-export SEED_PASSWORD='<pick something strong, 10+ chars>'
-export SEED_FIRST_NAME=Boss
+cd backend
+AWS_REGION=ap-southeast-2 \
+SEED_EMAIL=bosskero326@gmail.com \
+SEED_PASSWORD='<demo-password>' \
 go run ./cmd/seed
 ```
 
-Or run the seed binary baked into the backend image as a one-off ECS task:
+---
 
-```bash
-docker run --rm \
-  -e AWS_REGION=$AWS_REGION \
-  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
-  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
-  -e SEED_EMAIL=bosskero326@gmail.com \
-  -e SEED_PASSWORD='<strong>' \
-  --entrypoint /app/seed \
-  ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/bridgeai-backend:latest
-```
+## 5. Smoke test
 
-Re-running the seeder updates the password in place — safe to use for rotations.
+1. `curl https://bridgeai-backend.onrender.com/api/health` → `{"status":"healthy"}`
+2. `curl https://bridgeai-transcript.onrender.com/health` → `{"status":"ok"}` (or whatever the Python service returns)
+3. Visit your Vercel URL → log in with the seeded account → add a YouTube lecture from the home page → confirm bilingual subtitles appear, summary/quiz/vocab/chat/chapters render, citation pills seek the video.
+4. Install the Chrome extension (load unpacked from `chrome-extension/`) → click the toolbar icon → the detached panel should already point at the Render backend (from `config.js`). Open an Echo360 / Coursera / Udemy lecture → Translate Subtitles → verify bilingual overlay.
 
 ---
 
-## 8. Deploy the frontend (Vercel)
+## 6. Cold-start mitigation (optional)
 
-```bash
-cd ../frontend
-npx vercel --prod
-```
+Render Starter ($7/mo) keeps the backend warm. The transcript service on Standard ($25/mo) is also always-on. If you must stay on free tiers:
 
-Environment variable on Vercel: set `NEXT_PUBLIC_API_BASE` (if your `frontend/src/lib/api.ts` reads one — check there and wire it up if not) to the App Runner URL from step 6.
-
-CORS check: the backend's `CORS_ORIGINS` must include the Vercel URL.
+- Point [uptimerobot.com](https://uptimerobot.com) at `https://bridgeai-backend.onrender.com/api/health` and `https://bridgeai-transcript.onrender.com/health` every 10 min.
+- Expect first-request latency of ~30 s on a cold container + another ~15 s if Whisper model has to download (mitigated by the persistent disk).
 
 ---
 
-## 9. Ship the Chrome extension
+## 7. Known follow-ups (still on the backlog)
 
-One line to change before packaging: `chrome-extension/config.js` → set `DEFAULT_API_BASE` to the App Runner URL. Then:
-
-- Zip the `chrome-extension/` folder
-- Chrome Web Store → developer dashboard → upload
-
-Users who already installed will need to either reinstall or manually update the API URL in the popup settings (storage.sync retains the old value across updates).
-
-Also update `chrome-extension/manifest.json` `host_permissions` — replace `http://localhost:8080/*` with your App Runner domain.
-
----
-
-## Post-deploy checklist
-
-- [ ] `curl https://<apprunner>/api/health` returns 200
-- [ ] Transcript `/health` returns 200 (add the route if missing)
-- [ ] Log in as `bosskero326@gmail.com` from the Vercel URL
-- [ ] Paste a YouTube URL on `/home` → bilingual subtitles render within ~30s
-- [ ] Chrome extension on an Echo360 / Coursera / Udemy page translates correctly
-- [ ] `/home` shows courses across four platforms
-- [ ] EN ⇄ 中文 toggle in the Navbar works on landing and home
-
-## Known follow-ups
-
-These are deferred — flagged in the code review, not blocking the demo:
-
-- `ListCachedCourses` in `backend/internal/database/dynamo.go` does a full table scan on every `/api/courses` call. Acceptable at demo scale; migrate to a GSI or a separate courses table before scale.
-- Bedrock model + region are hardcoded in `backend/internal/services/bedrock.go`. Parameterise via env before multi-region.
-- Extension popup/sidepanel HTML still hardcode `localhost:8080` as the `<input>` default value; `config.js` only wins for the service-worker path. Not harmful (user can override in UI), but clean this up if time permits.
+- `ListCachedCourses` scans the whole DDB table. Fine for demo scale, needs a `user-id-index` GSI before public launch.
+- Bedrock model ID and region are hardcoded in [`bedrock.go`](internal/services/bedrock.go). Parameterize before expanding to other regions.
+- Frontend `NEXT_PUBLIC_API_URL` is read only at build time. Vercel auto-rebuilds on push to `main`, but setting the env var alone doesn't redeploy — use **Redeploy** in the Vercel dashboard.

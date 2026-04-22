@@ -521,13 +521,50 @@ func (h *CourseHandler) Chat(c *fiber.Ctx) error {
 		history[i] = services.ChatMessage{Role: m.Role, Content: m.Content}
 	}
 
-	answer, err := h.bedrock.ChatWithTranscript(segs, req.TargetLang, history)
+	answer, citations, err := h.bedrock.ChatWithTranscript(segs, req.TargetLang, history)
 	if err != nil {
 		log.Printf("[Handler] Chat error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "chat failed"})
 	}
 
-	return c.JSON(fiber.Map{"answer": answer})
+	return c.JSON(fiber.Map{"answer": answer, "citations": citations})
+}
+
+// GenerateChapters handles POST /api/chapters — topic segmentation of a cached transcript.
+func (h *CourseHandler) GenerateChapters(c *fiber.Ctx) error {
+	var req models.StudyMaterialRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.VideoURL == "" || req.TargetLang == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "video_url and target_lang required"})
+	}
+
+	videoID := extractVideoID(req.VideoURL)
+	if videoID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid video_url"})
+	}
+
+	cached, err := h.cache.GetCachedCourse(videoID, req.TargetLang)
+	if err != nil || cached == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "course not found"})
+	}
+
+	segs := make([]services.TranscriptSegment, len(cached.Subtitles))
+	for i, s := range cached.Subtitles {
+		segs[i] = services.TranscriptSegment{
+			StartSeconds: s.StartSeconds,
+			EndSeconds:   s.EndSeconds,
+			Text:         s.TextEN,
+		}
+	}
+
+	chapters, err := h.bedrock.GenerateChapters(segs, req.TargetLang)
+	if err != nil {
+		log.Printf("[Handler] GenerateChapters error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "chapters generation failed"})
+	}
+	return c.JSON(fiber.Map{"chapters": chapters})
 }
 
 // extractVideoID returns a stable cache key from a video URL.

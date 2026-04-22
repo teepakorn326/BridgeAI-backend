@@ -90,6 +90,7 @@ func main() {
 	api.Post("/quiz", courseHandler.GenerateQuiz)
 	api.Post("/vocab", courseHandler.ExtractVocab)
 	api.Post("/chat", courseHandler.Chat)
+	api.Post("/chapters", courseHandler.GenerateChapters)
 
 	// Start server
 	port := os.Getenv("PORT")

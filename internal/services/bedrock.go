@@ -307,18 +307,44 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
+// ChatCitation maps an inline [N] marker in a chat answer to the transcript
+// segment it references, so the frontend can render "jump to timestamp" buttons.
+type ChatCitation struct {
+	N            int     `json:"n"`
+	StartSeconds float64 `json:"start_seconds"`
+	EndSeconds   float64 `json:"end_seconds"`
+	TextEN       string  `json:"text_en"`
+}
+
 // ChatWithTranscript answers a question about a lecture transcript in the
-// target language, preserving conversation history.
-func (b *BedrockService) ChatWithTranscript(segments []TranscriptSegment, targetLang string, history []ChatMessage) (string, error) {
-	transcript := joinSegments(segments)
-	system := fmt.Sprintf(`You are a helpful study assistant for a university student.
-The student is studying a lecture. Answer their questions IN %s, grounded strictly in the transcript below.
+// target language. The answer contains inline [N] markers; each N resolves to
+// a ChatCitation pointing at the segment the model relied on.
+func (b *BedrockService) ChatWithTranscript(segments []TranscriptSegment, targetLang string, history []ChatMessage) (string, []ChatCitation, error) {
+	var numbered strings.Builder
+	for i, seg := range segments {
+		fmt.Fprintf(&numbered, "[%d] (%s) %s\n", i+1, formatTS(seg.StartSeconds), seg.Text)
+	}
+
+	system := fmt.Sprintf(`You are a helpful study assistant for a university student watching a recorded lecture.
+Answer their question IN %s, grounded strictly in the numbered transcript below.
 Keep English technical terms (API, GPU, ReLU, CNN, SQL, etc.) in English.
 If the transcript does not contain the answer, say so honestly IN %s — do not invent facts.
-Be concise, friendly, and explain concepts clearly at undergraduate level.
+Be concise and explain at undergraduate level. Use plain conversational prose; avoid heavy markdown (no ## headings, no --- separators). Short paragraphs and simple **bold** or bullet lists are fine.
 
-LECTURE TRANSCRIPT:
-%s`, targetLang, targetLang, transcript)
+OUTPUT FORMAT — STRICT:
+1. The FIRST line of your response MUST be a single-line JSON block of the form:
+   <CITES>[{"n":1,"seg":42},{"n":2,"seg":57}]</CITES>
+   - Emit this line EVEN IF you don't plan citations: <CITES>[]</CITES>
+   - One entry per distinct [N] marker you will use in the answer.
+   - "n" MUST equal the exact integer you put inside brackets in the answer (e.g. [1] -> {"n":1,...}). Never use arbitrary numbers like 1001.
+   - "seg" is the 1-based segment number from the numbered transcript below (the leading [N] on each transcript line) that supports that claim.
+2. After the <CITES> line, write your answer in %s.
+3. Inside the answer, whenever you make a factual claim or paraphrase, append the matching [N] marker. Use small numbers starting from [1]. You may reuse the same marker across sentences.
+
+Putting <CITES> first guarantees citations survive even if your answer is long — so plan it before you write.
+
+NUMBERED TRANSCRIPT:
+%s`, targetLang, targetLang, targetLang, numbered.String())
 
 	msgs := make([]claudeMessage, 0, len(history))
 	for _, m := range history {
@@ -329,18 +355,18 @@ LECTURE TRANSCRIPT:
 		msgs = append(msgs, claudeMessage{Role: role, Content: m.Content})
 	}
 	if len(msgs) == 0 || msgs[len(msgs)-1].Role != "user" {
-		return "", fmt.Errorf("chat history must end with a user message")
+		return "", nil, fmt.Errorf("chat history must end with a user message")
 	}
 
 	reqBody := claudeRequest{
 		AnthropicVersion: "bedrock-2023-05-31",
-		MaxTokens:        1024,
+		MaxTokens:        4096,
 		System:           system,
 		Messages:         msgs,
 	}
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("marshal chat request: %w", err)
+		return "", nil, fmt.Errorf("marshal chat request: %w", err)
 	}
 
 	result, err := b.client.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
@@ -349,17 +375,174 @@ LECTURE TRANSCRIPT:
 		Body:        reqBytes,
 	})
 	if err != nil {
-		return "", fmt.Errorf("bedrock chat error: %w", err)
+		return "", nil, fmt.Errorf("bedrock chat error: %w", err)
 	}
 
 	var resp claudeResponse
 	if err := json.Unmarshal(result.Body, &resp); err != nil {
-		return "", fmt.Errorf("unmarshal chat response: %w", err)
+		return "", nil, fmt.Errorf("unmarshal chat response: %w", err)
 	}
 	if len(resp.Content) == 0 {
-		return "", fmt.Errorf("bedrock returned empty chat content")
+		return "", nil, fmt.Errorf("bedrock returned empty chat content")
 	}
-	return resp.Content[0].Text, nil
+
+	answer, citations := parseChatCitations(resp.Content[0].Text, segments)
+	return answer, citations, nil
+}
+
+// parseChatCitations extracts the <CITES>[...]</CITES> block — which may be
+// at the start, end, or middle of the response — and returns the answer text
+// with the block stripped, plus the resolved citations.
+//
+// The model is instructed to emit <CITES> FIRST so citations survive answer
+// truncation, but the parser doesn't rely on position.
+//
+// Robust to truncation: if the block opens but never closes (max_tokens hit
+// inside the JSON), strip from <CITES> to end so no raw tag reaches the user.
+func parseChatCitations(raw string, segments []TranscriptSegment) (string, []ChatCitation) {
+	openIdx := strings.Index(raw, "<CITES>")
+	if openIdx < 0 {
+		return strings.TrimSpace(raw), nil
+	}
+	before := raw[:openIdx]
+
+	closeIdx := strings.Index(raw, "</CITES>")
+	if closeIdx < 0 || closeIdx < openIdx {
+		// Truncated — keep whatever came before the open tag as the answer.
+		return strings.TrimSpace(before), nil
+	}
+
+	after := raw[closeIdx+len("</CITES>"):]
+	answer := strings.TrimSpace(before + after)
+	payload := strings.TrimSpace(raw[openIdx+len("<CITES>") : closeIdx])
+
+	var rows []struct {
+		N   int `json:"n"`
+		Seg int `json:"seg"`
+	}
+	if err := json.Unmarshal([]byte(payload), &rows); err != nil {
+		return answer, nil
+	}
+
+	out := make([]ChatCitation, 0, len(rows))
+	for _, r := range rows {
+		idx := r.Seg - 1
+		if idx < 0 || idx >= len(segments) {
+			continue
+		}
+		s := segments[idx]
+		out = append(out, ChatCitation{
+			N:            r.N,
+			StartSeconds: s.StartSeconds,
+			EndSeconds:   s.EndSeconds,
+			TextEN:       s.Text,
+		})
+	}
+	return answer, out
+}
+
+// Chapter is a topical segment of a lecture identified by the model —
+// not a fixed-time slice.
+type Chapter struct {
+	StartSeconds    float64 `json:"start_seconds"`
+	EndSeconds      float64 `json:"end_seconds"`
+	TitleEN         string  `json:"title_en"`
+	TitleTranslated string  `json:"title_translated"`
+}
+
+// GenerateChapters asks the model to group the transcript into 5-10 topical
+// chapters with bilingual titles, then resolves segment indices to timestamps.
+func (b *BedrockService) GenerateChapters(segments []TranscriptSegment, targetLang string) ([]Chapter, error) {
+	if len(segments) == 0 {
+		return nil, nil
+	}
+
+	var numbered strings.Builder
+	for i, seg := range segments {
+		fmt.Fprintf(&numbered, "[%d] (%s) %s\n", i+1, formatTS(seg.StartSeconds), seg.Text)
+	}
+
+	system := fmt.Sprintf(`You are an expert at organizing lecture content into logical, topical chapters — NOT fixed-time slices.
+
+TASK: Read the numbered transcript and identify 5-10 chapters that match how the instructor actually structured the material (introduction, main concepts, worked examples, summary, etc).
+
+OUTPUT: ONLY a JSON array, no markdown fences, no preamble. Each chapter:
+- "start_seg": the 1-based segment number where this chapter begins.
+- "title_en": a short English title, 3-6 words, sentence case, no trailing punctuation.
+- "title_translated": the same title in %s. Keep technical terms in English (ReLU, API, SQL, gradient descent, etc.).
+
+RULES:
+- First chapter always starts at "start_seg": 1.
+- Chapters must be in order and non-overlapping.
+- 5 chapters minimum, 10 maximum.
+- No empty titles.`, targetLang)
+
+	reqBody := claudeRequest{
+		AnthropicVersion: "bedrock-2023-05-31",
+		MaxTokens:        2048,
+		System:           system,
+		Messages:         []claudeMessage{{Role: "user", Content: numbered.String()}},
+	}
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal chapters request: %w", err)
+	}
+
+	log.Printf("[Bedrock] GenerateChapters: %d segments → %s", len(segments), targetLang)
+	result, err := b.client.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
+		ModelId:     stringPtr(bedrockModel),
+		ContentType: stringPtr("application/json"),
+		Body:        reqBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("bedrock chapters error: %w", err)
+	}
+
+	var resp claudeResponse
+	if err := json.Unmarshal(result.Body, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal chapters response: %w", err)
+	}
+	if len(resp.Content) == 0 {
+		return nil, fmt.Errorf("bedrock returned empty chapters content")
+	}
+
+	var rows []struct {
+		StartSeg        int    `json:"start_seg"`
+		TitleEN         string `json:"title_en"`
+		TitleTranslated string `json:"title_translated"`
+	}
+	if err := json.Unmarshal([]byte(cleanJSON(resp.Content[0].Text)), &rows); err != nil {
+		return nil, fmt.Errorf("parse chapters JSON: %w\nRaw: %s", err, resp.Content[0].Text)
+	}
+
+	chapters := make([]Chapter, 0, len(rows))
+	lastEnd := segments[len(segments)-1].EndSeconds
+	for i, r := range rows {
+		idx := r.StartSeg - 1
+		if idx < 0 || idx >= len(segments) || r.TitleEN == "" {
+			continue
+		}
+		end := lastEnd
+		if i+1 < len(rows) {
+			nextIdx := rows[i+1].StartSeg - 1
+			if nextIdx > idx && nextIdx < len(segments) {
+				end = segments[nextIdx].StartSeconds
+			}
+		}
+		chapters = append(chapters, Chapter{
+			StartSeconds:    segments[idx].StartSeconds,
+			EndSeconds:      end,
+			TitleEN:         r.TitleEN,
+			TitleTranslated: r.TitleTranslated,
+		})
+	}
+	return chapters, nil
+}
+
+// formatTS renders seconds as mm:ss for prompt-side timestamps.
+func formatTS(seconds float64) string {
+	total := int(seconds)
+	return fmt.Sprintf("%02d:%02d", total/60, total%60)
 }
 
 // joinSegments concatenates segment texts into a single transcript string.
@@ -375,16 +558,39 @@ func joinSegments(segments []TranscriptSegment) string {
 // Summarize generates a structured markdown summary of the lecture in the target language.
 func (b *BedrockService) Summarize(segments []TranscriptSegment, targetLang string) (string, error) {
 	transcript := joinSegments(segments)
-	system := fmt.Sprintf(`You are an educational study assistant for IT/CS students.
-Summarize the following lecture transcript into clear, well-organized study notes IN %s.
+	system := fmt.Sprintf(`You are an educational study assistant for IT/CS students. Produce polished, exam-prep-style study notes IN %s from the lecture transcript below. Output MUST be GitHub-flavored markdown.
 
-Format as markdown with:
-- ## Main Topics (bullet points)
-- ## Key Concepts (term: explanation pairs)
-- ## Important Takeaways (numbered list)
+STRUCTURE — follow this skeleton in order:
 
-Keep technical terms (e.g. "machine learning", "neural network", "ReLU", "Sigmoid") in English even when writing in %s.
-Be concise but comprehensive. No preamble, no closing remarks — just the markdown.`, targetLang, targetLang)
+1. A top-level "# <emoji> <Lecture Title>" heading, where the emoji reflects the topic (e.g. 📈 for stats, 🧠 for ML, 🔐 for security, 💾 for databases, 🌐 for networking).
+2. **Brief Overview** — 2-3 sentences describing what the lecture covers.
+3. **Key Points** — 3-5 bullets listing learning objectives.
+4. A horizontal rule (---).
+5. 4-8 main sections. Each section:
+   - Starts with a "## <emoji> <Section Title>" header (emoji at the START, optionally a second emoji at the end).
+   - May contain "### <Subsection>" subheaders.
+   - Uses bulleted lists with *italicized* key terms inline.
+   - Uses "> <one-sentence definition>" blockquotes to define each core concept the first time it appears.
+   - Uses "> ⚠️ **Warning:** ..." blockquotes for common misconceptions or pitfalls explicitly raised in the transcript.
+   - Uses GFM tables (| col | col |) for any side-by-side comparison (scenarios, options, pros/cons, examples).
+   - Uses inline math in $...$ and block math in $$...$$ whenever the lecture discusses formulas (e.g. $R^2 = SSR/SST$).
+   - Includes an "**Example:**" or "### Example: <name>" subsection with concrete numbers whenever the transcript provides them.
+   - Separate sections with a horizontal rule (---).
+6. Final section "## 🧠 Exam-Prep Checklist" containing:
+   - **Quick Decision Thresholds** — bullets with concrete rules of thumb.
+   - **Must-Know Formulas / Facts** — bullets.
+   - **Common Pitfalls** — bullets.
+   - **Quick Reference** — bullets with critical values, constants, or cheatsheet items.
+
+LANGUAGE RULES:
+- All prose, explanations, and examples in %s.
+- Keep technical terms in English even when writing in %s: e.g. "machine learning", "neural network", "ReLU", "Sigmoid", "p-value", "gradient descent", "CNN", "SQL", "TCP".
+- Math symbols and LaTeX stay as-is.
+
+OUTPUT RULES:
+- Only include sections, tables, warnings, and examples that the transcript actually supports. Do NOT invent facts or examples.
+- Be concise but comprehensive: prioritize scannability and study usefulness.
+- No preamble ("Here is the summary…"), no closing remarks. Output the markdown directly.`, targetLang, targetLang, targetLang)
 
 	log.Printf("[Bedrock] Summarize: %d segments → %s", len(segments), targetLang)
 	return b.invokeClaude(system, transcript, 4096)
