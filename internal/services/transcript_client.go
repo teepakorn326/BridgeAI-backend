@@ -38,9 +38,9 @@ func NewTranscriptClient() *TranscriptClient {
 }
 
 // FetchTranscript retrieves the YouTube transcript for a video.
-func (t *TranscriptClient) FetchTranscript(videoID string) (*TranscriptResponse, error) {
-	url := fmt.Sprintf("%s/transcript/%s", t.baseURL, videoID)
-	log.Printf("[Transcript] Fetching transcript for video=%s", videoID)
+func (t *TranscriptClient) FetchTranscript(videoID, lang string) (*TranscriptResponse, error) {
+	url := fmt.Sprintf("%s/transcript/%s?lang=%s", t.baseURL, videoID, lang)
+	log.Printf("[Transcript] Fetching transcript for video=%s lang=%s", videoID, lang)
 
 	resp, err := http.Get(url)
 	if err != nil {

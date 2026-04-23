@@ -637,7 +637,7 @@ func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 	log.Printf("[Handler] Cache MISS — fetching real transcript")
 
 	// Step 2: Fetch real YouTube transcript
-	transcriptResp, err := h.transcript.FetchTranscript(videoID)
+	transcriptResp, err := h.transcript.FetchTranscript(videoID, req.TargetLang)
 	if err != nil {
 		log.Printf("[Handler] Transcript fetch error: %v", err)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
