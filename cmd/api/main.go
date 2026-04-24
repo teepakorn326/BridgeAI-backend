@@ -82,6 +82,7 @@ func main() {
 	// API routes (auth required)
 	api := app.Group("/api", authHandler.RequireAuth)
 	api.Post("/process-course", courseHandler.ProcessCourse)
+	api.Post("/fetch-transcript", courseHandler.FetchTranscript)
 	api.Post("/ingest-course", courseHandler.IngestCourse)
 	api.Get("/course", courseHandler.GetCourse)
 	api.Post("/translate-segments", courseHandler.TranslateSegments)

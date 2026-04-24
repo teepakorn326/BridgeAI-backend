@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -49,6 +50,95 @@ type CourseSummary struct {
 	VideoURL   string `json:"video_url"`
 	Title      string `json:"title"`
 	TargetLang string `json:"target_lang"`
+}
+
+// userCourseLink records that a user has processed or opened a given
+// (videoID, targetLang) course. It's the per-user library — the shared
+// translation cache under VIDEO#/STUDY# keys stays global so the expensive
+// AI work is reused across users, but the dashboard list is scoped to
+// whatever each user has actually touched.
+type userCourseLink struct {
+	PK         string `dynamodbav:"PK"`
+	SK         string `dynamodbav:"SK"`
+	VideoID    string `dynamodbav:"video_id"`
+	VideoURL   string `dynamodbav:"video_url"`
+	Title      string `dynamodbav:"title"`
+	TargetLang string `dynamodbav:"target_lang"`
+	CreatedAt  string `dynamodbav:"created_at"`
+}
+
+// LinkUserToCourse records that userID has opened (videoID, targetLang).
+// Idempotent — re-linking just overwrites the existing item.
+func (c *CacheService) LinkUserToCourse(userID, videoID, videoURL, title, targetLang string) error {
+	if userID == "" {
+		return fmt.Errorf("userID required")
+	}
+	item := userCourseLink{
+		PK:         fmt.Sprintf("USER#%s", userID),
+		SK:         fmt.Sprintf("COURSE#%s#%s", videoID, targetLang),
+		VideoID:    videoID,
+		VideoURL:   videoURL,
+		Title:      title,
+		TargetLang: targetLang,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	av, err := attributevalue.MarshalMap(item)
+	if err != nil {
+		return fmt.Errorf("marshal user-course link error: %w", err)
+	}
+	_, err = c.client.PutItem(context.TODO(), &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item:      av,
+	})
+	if err != nil {
+		return fmt.Errorf("DynamoDB PutItem error: %w", err)
+	}
+	return nil
+}
+
+// ListUserCourses returns the courses this user has opened.
+// Uses Query with PK=USER#<id> — no filter scan.
+func (c *CacheService) ListUserCourses(userID string) ([]CourseSummary, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("userID required")
+	}
+	var summaries []CourseSummary
+	var lastKey map[string]types.AttributeValue
+
+	for {
+		out, err := c.client.Query(context.TODO(), &dynamodb.QueryInput{
+			TableName:              aws.String(tableName),
+			KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :sk)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk": &types.AttributeValueMemberS{Value: fmt.Sprintf("USER#%s", userID)},
+				":sk": &types.AttributeValueMemberS{Value: "COURSE#"},
+			},
+			ExclusiveStartKey: lastKey,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("DynamoDB Query error: %w", err)
+		}
+
+		for _, raw := range out.Items {
+			var item userCourseLink
+			if err := attributevalue.UnmarshalMap(raw, &item); err != nil {
+				continue
+			}
+			summaries = append(summaries, CourseSummary{
+				VideoID:    item.VideoID,
+				VideoURL:   item.VideoURL,
+				Title:      item.Title,
+				TargetLang: item.TargetLang,
+			})
+		}
+
+		if out.LastEvaluatedKey == nil {
+			break
+		}
+		lastKey = out.LastEvaluatedKey
+	}
+
+	return summaries, nil
 }
 
 // ListCachedCourses returns all cached video translations as summaries.

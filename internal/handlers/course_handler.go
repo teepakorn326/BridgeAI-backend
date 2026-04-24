@@ -194,7 +194,14 @@ func (h *CourseHandler) ExtractVocab(c *fiber.Ctx) error {
 // ListCourses handles GET /api/courses — returns all cached courses.
 // Backfills missing/fallback titles by fetching from YouTube oEmbed.
 func (h *CourseHandler) ListCourses(c *fiber.Ctx) error {
-	summaries, err := h.cache.ListCachedCourses()
+	userID, _ := c.Locals("userID").(string)
+	if userID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Not authenticated",
+		})
+	}
+
+	summaries, err := h.cache.ListUserCourses(userID)
 	if err != nil {
 		log.Printf("[Handler] ListCourses error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -317,6 +324,11 @@ func (h *CourseHandler) IngestCourse(c *fiber.Ctx) error {
 
 	if cached, _ := h.cache.GetCachedCourse(videoID, req.TargetLang); cached != nil {
 		log.Printf("[Handler] Ingest cache HIT — returning existing")
+		if uid, _ := c.Locals("userID").(string); uid != "" {
+			if err := h.cache.LinkUserToCourse(uid, videoID, cached.VideoURL, cached.Title, req.TargetLang); err != nil {
+				log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
+			}
+		}
 		return c.JSON(cached)
 	}
 
@@ -371,6 +383,12 @@ func (h *CourseHandler) IngestCourse(c *fiber.Ctx) error {
 
 	if err := h.cache.SaveToCache(videoID, req.TargetLang, response); err != nil {
 		log.Printf("[Handler] Ingest cache save error: %v", err)
+	}
+
+	if uid, _ := c.Locals("userID").(string); uid != "" {
+		if err := h.cache.LinkUserToCourse(uid, videoID, response.VideoURL, response.Title, req.TargetLang); err != nil {
+			log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
+		}
 	}
 
 	// Kick off study-material generation in the background.
@@ -604,6 +622,67 @@ func extractVideoID(videoURL string) string {
 }
 
 // ProcessCourse handles POST /api/process-course.
+// FetchTranscript handles POST /api/fetch-transcript. It returns either a
+// full cached course (so the frontend can skip translation) or the raw English
+// segments for the frontend to batch-translate via /api/translate-segments.
+// Splitting this out enables real per-batch progress reporting on the client.
+func (h *CourseHandler) FetchTranscript(c *fiber.Ctx) error {
+	var req models.ProcessRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request body. Required: video_url, target_lang",
+		})
+	}
+	if req.VideoURL == "" || req.TargetLang == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Both video_url and target_lang are required",
+		})
+	}
+
+	videoID := extractVideoID(req.VideoURL)
+
+	if cached, err := h.cache.GetCachedCourse(videoID, req.TargetLang); err != nil {
+		log.Printf("[Handler] FetchTranscript cache lookup error (non-fatal): %v", err)
+	} else if cached != nil {
+		log.Printf("[Handler] FetchTranscript cache HIT for video=%s lang=%s", videoID, req.TargetLang)
+		if uid, _ := c.Locals("userID").(string); uid != "" {
+			if err := h.cache.LinkUserToCourse(uid, videoID, cached.VideoURL, cached.Title, req.TargetLang); err != nil {
+				log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
+			}
+		}
+		return c.JSON(fiber.Map{"cached": cached})
+	}
+
+	transcriptResp, err := h.transcript.FetchTranscript(videoID, req.TargetLang)
+	if err != nil {
+		log.Printf("[Handler] FetchTranscript error: %v", err)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Could not fetch transcript for this video. Make sure the video has captions available.",
+		})
+	}
+
+	segs := make([]models.SegmentInput, len(transcriptResp.Segments))
+	for i, s := range transcriptResp.Segments {
+		segs[i] = models.SegmentInput{
+			Start: s.StartSeconds,
+			End:   s.EndSeconds,
+			Text:  s.Text,
+		}
+	}
+
+	title := fetchYouTubeTitle(videoID)
+	if title == "" {
+		title = fmt.Sprintf("Video %s", videoID)
+	}
+
+	return c.JSON(fiber.Map{
+		"video_id":  videoID,
+		"video_url": req.VideoURL,
+		"title":     title,
+		"segments":  segs,
+	})
+}
+
 func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 	var req models.ProcessRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -631,6 +710,11 @@ func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 
 	if cached != nil {
 		log.Printf("[Handler] Cache HIT for video=%s lang=%s", videoID, req.TargetLang)
+		if uid, _ := c.Locals("userID").(string); uid != "" {
+			if err := h.cache.LinkUserToCourse(uid, videoID, cached.VideoURL, cached.Title, req.TargetLang); err != nil {
+				log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
+			}
+		}
 		return c.JSON(cached)
 	}
 
@@ -676,6 +760,12 @@ func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 			log.Printf("[Handler] Failed to cache result: %v", err)
 		}
 	}()
+
+	if uid, _ := c.Locals("userID").(string); uid != "" {
+		if err := h.cache.LinkUserToCourse(uid, videoID, response.VideoURL, response.Title, req.TargetLang); err != nil {
+			log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
+		}
+	}
 
 	log.Printf("[Handler] Returning %d subtitle lines", len(subtitles))
 	return c.JSON(response)
