@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 
@@ -26,16 +27,47 @@ type BedrockService struct {
 }
 
 // claudeRequest is the Anthropic Messages API request body for Bedrock.
+// System is `any` so callers can pass either a plain string or a slice of
+// systemBlock to enable prompt caching on the system prompt.
 type claudeRequest struct {
 	AnthropicVersion string          `json:"anthropic_version"`
 	MaxTokens        int             `json:"max_tokens"`
-	System           string          `json:"system"`
+	System           any             `json:"system"`
 	Messages         []claudeMessage `json:"messages"`
 }
 
 type claudeMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role string `json:"role"`
+	// Content is `any` so callers can pass either a plain string (most
+	// callers) or a slice of contentBlock for multimodal input (PDF upload).
+	Content any `json:"content"`
+}
+
+// contentBlock is one element of a multimodal user message — used to send a
+// PDF document alongside a text instruction. Plain-string Content is the
+// simpler/preferred form for text-only calls.
+type contentBlock struct {
+	Type   string     `json:"type"`             // "text" or "document"
+	Text   string     `json:"text,omitempty"`   // populated when Type == "text"
+	Source *docSource `json:"source,omitempty"` // populated when Type == "document"
+}
+
+type docSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // "application/pdf"
+	Data      string `json:"data"`       // base64-encoded PDF bytes
+}
+
+// systemBlock is one entry in the structured `system` array — used to mark
+// part of the system prompt as cacheable via cache_control.
+type systemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+type cacheControl struct {
+	Type string `json:"type"`
 }
 
 // claudeResponse is the Anthropic Messages API response body.
@@ -57,7 +89,14 @@ func NewBedrockService() (*BedrockService, error) {
 	// our own exponential backoff in TranslateSegments. NopRetryer alone
 	// only stops retries; the rate limiter still depletes tokens and
 	// refuses calls with "0 available, 5 requested" errors.
+	//
+	// HTTP timeout bumped to 5 minutes — Bedrock's response stream for
+	// large model outputs (lesson generation, long summaries) can take
+	// 30-60+ seconds, and the SDK's default HTTP client kept hitting a
+	// "read: operation timed out" mid-deserialization.
+	httpClient := awshttp.NewBuildableClient().WithTimeout(5 * time.Minute)
 	client := bedrockruntime.NewFromConfig(cfg, func(o *bedrockruntime.Options) {
+		o.HTTPClient = httpClient
 		o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
 			so.MaxAttempts = 1
 			so.RateLimiter = ratelimit.None
@@ -68,14 +107,31 @@ func NewBedrockService() (*BedrockService, error) {
 }
 
 const (
-	chunkSize   = 15 // segments per Bedrock call
-	concurrency = 5  // parallel Bedrock calls (lower = fewer 429s)
+	chunkSize   = 40 // segments per Bedrock call (bigger = fewer 429s, but more output tokens per call)
+	concurrency = 8  // parallel Bedrock calls — retry/backoff below absorbs occasional 429s
 	maxAttempts = 6  // total attempts per chunk with exponential backoff
 )
 
 // TranslateSegments chunks the transcript and translates batches in parallel,
-// then merges results with original timestamps.
+// then merges results with original timestamps. When targetLang is English,
+// translation is a no-op — we return identity subtitles so the rest of the
+// pipeline (cache, frontend bilingual view) keeps working without burning
+// Bedrock tokens on English-to-English passthroughs.
 func (b *BedrockService) TranslateSegments(segments []TranscriptSegment, targetLang string) ([]models.SubtitleLine, error) {
+	if isEnglishTarget(targetLang) {
+		log.Printf("[Bedrock] TranslateSegments: target=English, skipping Bedrock — %d segments passthrough", len(segments))
+		out := make([]models.SubtitleLine, len(segments))
+		for i, seg := range segments {
+			out[i] = models.SubtitleLine{
+				StartSeconds:   seg.StartSeconds,
+				EndSeconds:     seg.EndSeconds,
+				TextEN:         seg.Text,
+				TextTranslated: seg.Text,
+			}
+		}
+		return out, nil
+	}
+
 	// Build chunks
 	var chunks [][]TranscriptSegment
 	for i := 0; i < len(segments); i += chunkSize {
@@ -166,10 +222,22 @@ ABSOLUTE RULES (violations will be rejected):
 If a line is a single technical term, acronym, or number, keep it as-is. Otherwise translate the non-technical parts.`,
 		targetLang, targetLang, len(segments), targetLang, targetLang, targetLang, targetLang, targetLang, len(segments))
 
+	// Mark the system prompt as cacheable. The prompt is identical across all
+	// chunks of a lecture (only targetLang and segment-count change, and
+	// segment-count is constant for all chunks except the last), so subsequent
+	// calls within the 5-min cache TTL hit the cache for ~90% input-token
+	// discount and faster TTFT. If under Bedrock's minimum cacheable token
+	// threshold the marker is a no-op — safe either way.
 	reqBody := claudeRequest{
 		AnthropicVersion: "bedrock-2023-05-31",
 		MaxTokens:        8192,
-		System:           systemPrompt,
+		System: []systemBlock{
+			{
+				Type:         "text",
+				Text:         systemPrompt,
+				CacheControl: &cacheControl{Type: "ephemeral"},
+			},
+		},
 		Messages: []claudeMessage{
 			{Role: "user", Content: numberedInput.String()},
 		},
@@ -555,10 +623,17 @@ func joinSegments(segments []TranscriptSegment) string {
 	return sb.String()
 }
 
-// Summarize generates a structured markdown summary of the lecture in the target language.
-func (b *BedrockService) Summarize(segments []TranscriptSegment, targetLang string) (string, error) {
-	transcript := joinSegments(segments)
-	system := fmt.Sprintf(`You are an educational study assistant for IT/CS students. Produce polished, exam-prep-style study notes IN %s from the lecture transcript below. Output MUST be GitHub-flavored markdown.
+// Summarize generates a structured markdown summary with inline citations
+// pointing to specific lecture segments. Returned citations resolve [N]
+// markers in the markdown to (start_seconds, end_seconds, text) so the
+// frontend can render seek pills.
+func (b *BedrockService) Summarize(segments []TranscriptSegment, targetLang string) (string, []ChatCitation, error) {
+	var numbered strings.Builder
+	for i, seg := range segments {
+		fmt.Fprintf(&numbered, "[%d] (%s) %s\n", i+1, formatTS(seg.StartSeconds), seg.Text)
+	}
+
+	system := fmt.Sprintf(`You are an educational study assistant for university students. Produce polished, exam-prep-style study notes IN %s from the numbered lecture transcript below. Output MUST be GitHub-flavored markdown.
 
 STRUCTURE — follow this skeleton in order:
 
@@ -567,33 +642,44 @@ STRUCTURE — follow this skeleton in order:
 3. **Key Points** — 3-5 bullets listing learning objectives.
 4. A horizontal rule (---).
 5. 4-8 main sections. Each section:
-   - Starts with a "## <emoji> <Section Title>" header (emoji at the START, optionally a second emoji at the end).
+   - Starts with a "## <emoji> <Section Title>" header.
    - May contain "### <Subsection>" subheaders.
    - Uses bulleted lists with *italicized* key terms inline.
-   - Uses "> <one-sentence definition>" blockquotes to define each core concept the first time it appears.
-   - Uses "> ⚠️ **Warning:** ..." blockquotes for common misconceptions or pitfalls explicitly raised in the transcript.
-   - Uses GFM tables (| col | col |) for any side-by-side comparison (scenarios, options, pros/cons, examples).
-   - Uses inline math in $...$ and block math in $$...$$ whenever the lecture discusses formulas (e.g. $R^2 = SSR/SST$).
-   - Includes an "**Example:**" or "### Example: <name>" subsection with concrete numbers whenever the transcript provides them.
-   - Separate sections with a horizontal rule (---).
-6. Final section "## 🧠 Exam-Prep Checklist" containing:
-   - **Quick Decision Thresholds** — bullets with concrete rules of thumb.
-   - **Must-Know Formulas / Facts** — bullets.
-   - **Common Pitfalls** — bullets.
-   - **Quick Reference** — bullets with critical values, constants, or cheatsheet items.
+   - Uses "> <one-sentence definition>" blockquotes to define each core concept.
+   - Uses "> ⚠️ **Warning:** ..." blockquotes for common misconceptions raised in the transcript.
+   - Uses GFM tables for any side-by-side comparison.
+   - Uses inline math in $...$ and block math in $$...$$ for formulas.
+   - Includes an "**Example:**" subsection with concrete numbers when the transcript provides them.
+   - Separated by horizontal rules (---).
+6. Final section "## 🧠 Exam-Prep Checklist":
+   - **Quick Decision Thresholds**, **Must-Know Formulas / Facts**, **Common Pitfalls**, **Quick Reference**.
 
 LANGUAGE RULES:
-- All prose, explanations, and examples in %s.
-- Keep technical terms in English even when writing in %s: e.g. "machine learning", "neural network", "ReLU", "Sigmoid", "p-value", "gradient descent", "CNN", "SQL", "TCP".
-- Math symbols and LaTeX stay as-is.
+- All prose IN %s.
+- Keep technical terms in English even when writing %s ("machine learning", "ReLU", "p-value", "SQL", etc.).
+- Math/LaTeX stays as-is.
+
+CITATIONS — STRICT:
+1. The FIRST line of your output MUST be a single-line JSON block of the form:
+   <CITES>[{"n":1,"seg":42},{"n":2,"seg":57}]</CITES>
+   - Emit this line EVEN IF you don't plan citations: <CITES>[]</CITES>
+   - One entry per distinct [N] marker you will use.
+   - "n" MUST equal the integer you put inside brackets in the markdown.
+   - "seg" is the 1-based segment number from the numbered transcript below.
+2. After the <CITES> line, output the markdown summary.
+3. Inside the markdown, append [N] markers after factual claims, definitions, examples, and formulas. Reuse the same N across sentences. Aim for 8-20 citations total.
 
 OUTPUT RULES:
-- Only include sections, tables, warnings, and examples that the transcript actually supports. Do NOT invent facts or examples.
-- Be concise but comprehensive: prioritize scannability and study usefulness.
-- No preamble ("Here is the summary…"), no closing remarks. Output the markdown directly.`, targetLang, targetLang, targetLang)
+- Only include sections, tables, warnings, and examples the transcript actually supports. Do NOT invent.
+- No preamble, no closing remarks. Just <CITES> followed by the markdown.`, targetLang, targetLang, targetLang)
 
 	log.Printf("[Bedrock] Summarize: %d segments → %s", len(segments), targetLang)
-	return b.invokeClaude(system, transcript, 4096)
+	raw, err := b.invokeClaude(system, numbered.String(), 4096)
+	if err != nil {
+		return "", nil, err
+	}
+	summary, citations := parseChatCitations(raw, segments)
+	return summary, citations, nil
 }
 
 // GenerateQuiz creates 8 multiple-choice questions in the target language.
@@ -653,6 +739,14 @@ Rules:
 		return nil, fmt.Errorf("parse vocab JSON: %w\nRaw: %s", err, raw)
 	}
 	return vocab, nil
+}
+
+// isEnglishTarget returns true when the user picked English as their target
+// language — in which case translation is a no-op and we skip Bedrock
+// entirely. Tolerant of casing and the short "en" form.
+func isEnglishTarget(targetLang string) bool {
+	t := strings.TrimSpace(strings.ToLower(targetLang))
+	return t == "english" || t == "en"
 }
 
 // cleanJSON strips markdown fences and trims whitespace.

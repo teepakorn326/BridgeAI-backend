@@ -97,6 +97,23 @@ func (h *CourseHandler) loadCachedSegments(videoURL, targetLang string) ([]servi
 	return segs, nil
 }
 
+// summaryEnvelope wraps a markdown summary with its source citations so they
+// stay together in the cache. Older cached entries are plain-text markdown
+// without citations — decodeLectureSummary handles both shapes.
+type summaryEnvelope struct {
+	Summary   string                  `json:"summary"`
+	Citations []services.ChatCitation `json:"citations,omitempty"`
+}
+
+func decodeLectureSummary(cached string) summaryEnvelope {
+	var env summaryEnvelope
+	if json.Unmarshal([]byte(cached), &env) == nil && env.Summary != "" {
+		return env
+	}
+	// Legacy plain-text cache — surface as a citation-less envelope.
+	return summaryEnvelope{Summary: cached}
+}
+
 // Summarize handles POST /api/summarize.
 func (h *CourseHandler) Summarize(c *fiber.Ctx) error {
 	var req models.StudyMaterialRequest
@@ -107,7 +124,8 @@ func (h *CourseHandler) Summarize(c *fiber.Ctx) error {
 
 	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "summary"); cached != "" {
 		log.Printf("[Handler] Summary cache HIT for %s/%s", videoID, req.TargetLang)
-		return c.JSON(fiber.Map{"summary": cached, "from_cache": true})
+		env := decodeLectureSummary(cached)
+		return c.JSON(fiber.Map{"summary": env.Summary, "citations": env.Citations, "from_cache": true})
 	}
 
 	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
@@ -115,14 +133,16 @@ func (h *CourseHandler) Summarize(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	summary, err := h.bedrock.Summarize(segs, req.TargetLang)
+	summary, citations, err := h.bedrock.Summarize(segs, req.TargetLang)
 	if err != nil {
 		log.Printf("[Handler] Summarize error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Summary generation failed"})
 	}
 
-	go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "summary", summary)
-	return c.JSON(fiber.Map{"summary": summary, "from_cache": false})
+	if data, jerr := json.Marshal(summaryEnvelope{Summary: summary, Citations: citations}); jerr == nil {
+		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "summary", string(data))
+	}
+	return c.JSON(fiber.Map{"summary": summary, "citations": citations, "from_cache": false})
 }
 
 // GenerateQuiz handles POST /api/quiz.
@@ -398,20 +418,26 @@ func (h *CourseHandler) IngestCourse(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-// generateStudyMaterials runs Summarize, GenerateQuiz, and ExtractVocab
-// in parallel and writes each to the DynamoDB cache. Used by IngestCourse.
+// generateStudyMaterials runs Summarize, GenerateQuiz, ExtractVocab, and
+// GenerateLesson in parallel and writes each to the DynamoDB cache. Used
+// by IngestCourse.
 func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs []services.TranscriptSegment) {
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
-		summary, err := h.bedrock.Summarize(segs, targetLang)
+		summary, citations, err := h.bedrock.Summarize(segs, targetLang)
 		if err != nil {
 			log.Printf("[Handler] auto-summary error: %v", err)
 			return
 		}
-		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "summary", summary); err != nil {
+		data, jerr := json.Marshal(summaryEnvelope{Summary: summary, Citations: citations})
+		if jerr != nil {
+			log.Printf("[Handler] auto-summary marshal error: %v", jerr)
+			return
+		}
+		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "summary", string(data)); err != nil {
 			log.Printf("[Handler] auto-summary cache error: %v", err)
 		}
 	}()
@@ -439,6 +465,19 @@ func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs 
 		raw, _ := json.Marshal(vocab)
 		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "vocab", string(raw)); err != nil {
 			log.Printf("[Handler] auto-vocab cache error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		lessons, err := h.bedrock.GenerateLectureLesson(segs, targetLang)
+		if err != nil {
+			log.Printf("[Handler] auto-lesson error: %v", err)
+			return
+		}
+		raw, _ := json.Marshal(lessons)
+		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "lesson", string(raw)); err != nil {
+			log.Printf("[Handler] auto-lesson cache error: %v", err)
 		}
 	}()
 
@@ -478,13 +517,14 @@ func (h *CourseHandler) GetCourse(c *fiber.Ctx) error {
 }
 
 // ensureStudyMaterials triggers background generation for any of
-// summary/quiz/vocab that aren't already cached. Safe to call on every
-// GetCourse — skips quickly if all three exist.
+// summary/quiz/vocab/lesson that aren't already cached. Safe to call on
+// every GetCourse — skips quickly if all four exist.
 func (h *CourseHandler) ensureStudyMaterials(videoID, targetLang string, subtitles []models.SubtitleLine) {
 	summary, _ := h.cache.GetStudyMaterial(videoID, targetLang, "summary")
 	quiz, _ := h.cache.GetStudyMaterial(videoID, targetLang, "quiz")
 	vocab, _ := h.cache.GetStudyMaterial(videoID, targetLang, "vocab")
-	if summary != "" && quiz != "" && vocab != "" {
+	lesson, _ := h.cache.GetStudyMaterial(videoID, targetLang, "lesson")
+	if summary != "" && quiz != "" && vocab != "" && lesson != "" {
 		return
 	}
 
@@ -497,8 +537,8 @@ func (h *CourseHandler) ensureStudyMaterials(videoID, targetLang string, subtitl
 		}
 	}
 
-	log.Printf("[Handler] Backfilling study materials for %s/%s (summary=%v quiz=%v vocab=%v)",
-		videoID, targetLang, summary == "", quiz == "", vocab == "")
+	log.Printf("[Handler] Backfilling study materials for %s/%s (summary=%v quiz=%v vocab=%v lesson=%v)",
+		videoID, targetLang, summary == "", quiz == "", vocab == "", lesson == "")
 	h.generateStudyMaterials(videoID, targetLang, segs)
 }
 
@@ -546,6 +586,40 @@ func (h *CourseHandler) Chat(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"answer": answer, "citations": citations})
+}
+
+// GenerateLesson handles POST /api/lesson — splits a lecture into chapter
+// cards, each with its own summary + small quiz + citations.
+func (h *CourseHandler) GenerateLesson(c *fiber.Ctx) error {
+	var req models.StudyMaterialRequest
+	if err := c.BodyParser(&req); err != nil || req.VideoURL == "" || req.TargetLang == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "video_url and target_lang required"})
+	}
+	videoID := extractVideoID(req.VideoURL)
+
+	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "lesson"); cached != "" {
+		var lessons []services.LectureLesson
+		if err := json.Unmarshal([]byte(cached), &lessons); err == nil {
+			return c.JSON(fiber.Map{"lessons": lessons, "from_cache": true})
+		}
+	}
+
+	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	lessons, err := h.bedrock.GenerateLectureLesson(segs, req.TargetLang)
+	if err != nil {
+		log.Printf("[Handler] GenerateLesson error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Lesson generation failed: " + err.Error(),
+		})
+	}
+	if data, jerr := json.Marshal(lessons); jerr == nil {
+		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "lesson", string(data))
+	}
+	return c.JSON(fiber.Map{"lessons": lessons, "from_cache": false})
 }
 
 // GenerateChapters handles POST /api/chapters — topic segmentation of a cached transcript.
@@ -657,7 +731,7 @@ func (h *CourseHandler) FetchTranscript(c *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("[Handler] FetchTranscript error: %v", err)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Could not fetch transcript for this video. Make sure the video has captions available.",
+			"error": err.Error(),
 		})
 	}
 
@@ -725,7 +799,7 @@ func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("[Handler] Transcript fetch error: %v", err)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Could not fetch transcript for this video. Make sure the video has captions available.",
+			"error": err.Error(),
 		})
 	}
 
@@ -766,6 +840,10 @@ func (h *CourseHandler) ProcessCourse(c *fiber.Ctx) error {
 			log.Printf("[Handler] LinkUserToCourse error (non-fatal): %v", err)
 		}
 	}
+
+	// Kick off summary/quiz/vocab generation in the background so the
+	// dashboard already has them by the time the user opens the course.
+	go h.generateStudyMaterials(videoID, req.TargetLang, transcriptResp.Segments)
 
 	log.Printf("[Handler] Returning %d subtitle lines", len(subtitles))
 	return c.JSON(response)

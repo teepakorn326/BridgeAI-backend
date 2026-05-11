@@ -28,6 +28,27 @@ cache_table() {
   echo "[ready] $name"
 }
 
+documents_table() {
+  local name="StudyMind_Documents"
+  if aws dynamodb describe-table --table-name "$name" --region "$REGION" >/dev/null 2>&1; then
+    echo "[skip] $name already exists"
+    return
+  fi
+  echo "[create] $name"
+  aws dynamodb create-table \
+    --region "$REGION" \
+    --table-name "$name" \
+    --attribute-definitions \
+      AttributeName=PK,AttributeType=S \
+      AttributeName=SK,AttributeType=S \
+    --key-schema \
+      AttributeName=PK,KeyType=HASH \
+      AttributeName=SK,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --table-name "$name" --region "$REGION"
+  echo "[ready] $name"
+}
+
 users_table() {
   local name="StudyMind_Users"
   if aws dynamodb describe-table --table-name "$name" --region "$REGION" >/dev/null 2>&1; then
@@ -59,5 +80,6 @@ users_table() {
 }
 
 cache_table
+documents_table
 users_table
 echo "Done."

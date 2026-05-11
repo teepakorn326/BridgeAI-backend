@@ -37,11 +37,15 @@ func main() {
 
 	// Create handlers with dependencies
 	courseHandler := handlers.NewCourseHandler(cache, bedrock, transcript)
+	documentHandler := handlers.NewDocumentHandler(cache, bedrock)
 	authHandler := handlers.NewAuthHandler(cache)
 
-	// Initialize Fiber
+	// Initialize Fiber. BodyLimit is bumped above the default 4MB so PDF
+	// and audio uploads up to ~150MB go through (Whisper itself caps the
+	// usable duration via MAX_DURATION_WHISPER on the transcript service).
 	app := fiber.New(fiber.Config{
-		AppName: "StudyMind AI API v1.0",
+		AppName:   "StudyMind AI API v1.0",
+		BodyLimit: 200 * 1024 * 1024,
 	})
 
 	// CORS middleware — allow frontend origin
@@ -92,6 +96,19 @@ func main() {
 	api.Post("/vocab", courseHandler.ExtractVocab)
 	api.Post("/chat", courseHandler.Chat)
 	api.Post("/chapters", courseHandler.GenerateChapters)
+	api.Post("/lesson", courseHandler.GenerateLesson)
+	api.Post("/upload-audio", courseHandler.UploadAudio)
+
+	// Document pipeline (PDF/DOCX/PPTX/TXT/image) — page-aware, separate
+	// from lectures. See backend/internal/handlers/document_handler.go.
+	api.Post("/upload-document", documentHandler.UploadDocument)
+	api.Get("/document", documentHandler.GetDocument)
+	api.Get("/documents", documentHandler.ListDocuments)
+	api.Post("/document/summary", documentHandler.SummarizeDocument)
+	api.Post("/document/quiz", documentHandler.GenerateDocumentQuiz)
+	api.Post("/document/vocab", documentHandler.ExtractDocumentVocab)
+	api.Post("/document/lesson", documentHandler.GenerateDocumentLesson)
+	api.Post("/document/chat", documentHandler.ChatWithDocument)
 
 	// Start server
 	port := os.Getenv("PORT")
