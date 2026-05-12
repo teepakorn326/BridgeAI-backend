@@ -257,30 +257,41 @@ func joinBlocksPlain(blocks []models.DocumentBlock) string {
 // text) tuple so the frontend can render "jump to source" pills.
 func (b *BedrockService) SummarizeDocument(blocks []models.DocumentBlock, targetLang string) (string, []models.DocumentChatCitation, error) {
 	body := joinBlocksWithPages(blocks)
-	system := fmt.Sprintf(`You are an educational study assistant. Produce polished, exam-prep-style study notes IN %s from the numbered document blocks below (slides, textbook chapter, paper, or reading). Output MUST be GitHub-flavored markdown.
+	system := fmt.Sprintf(`You are an educational study assistant. Produce comprehensive, exam-prep-style study notes IN %s from the numbered document blocks below (slides, textbook chapter, paper, or reading). Output MUST be GitHub-flavored markdown. Target length 1500-2500 words — this is a study unit, not a description of one.
 
 STRUCTURE:
 1. "# <Document Title or Topic>" heading.
-2. **Overview** — 2-3 sentences on what the document covers.
-3. **Key Concepts** — 3-5 bullets listing the most important takeaways.
-4. A horizontal rule (---).
-5. 3-7 main sections that mirror the document's actual structure. Each section:
-   - Starts with "## <Section Title>".
-   - Uses bulleted lists with *italicized* key terms inline.
-   - Uses "> <one-sentence definition>" blockquotes for the first appearance of each core term.
-   - Uses GFM tables for any side-by-side comparison the document presents.
-   - Uses inline math in $...$ and block math in $$...$$ when the document has formulas.
-   - Adds an "**Example:**" block whenever the document gives concrete numbers or worked examples.
+2. **Overview** — 3-5 sentences on what the document covers, the problem it addresses, and the level it pitches at.
+3. **Learning Objectives** — 5-7 bullets stating what a reader should be able to do after studying these notes (use verbs like "explain", "compare", "derive", "apply").
+4. **Prerequisites** — 2-4 bullets listing concepts a reader should already know.
+5. A horizontal rule (---).
+6. 6-10 main sections mirroring the document's structure (NOT 3-4 — expand). Each section MUST contain:
+   - "## <Section Title>" header.
+   - A 2-3 sentence intro paragraph framing the section.
+   - At least one "### <Subsection>" subheader.
+   - Bulleted lists with *italicized* key terms inline.
+   - "> <one-sentence definition>" blockquotes for every core term the first time it appears (do not skip).
+   - "> ⚠️ **Warning:** ..." blockquotes for misconceptions or edge cases.
+   - GFM tables for any comparison, parameter list, or option matrix.
+   - Inline math in $...$ and block math in $$...$$ for any formula, including derivations the document walks through.
+   - "**Example:**" subsection with concrete numbers when the document supplies them. If the topic supports it but the source has no example, use "**Worked scenario:**" with a plausible illustrative case.
    - Separated by horizontal rules (---).
-6. Final section "## Exam-Prep Checklist":
+7. Final section "## Exam-Prep Checklist":
    - **Must-Know Concepts** — bullets.
-   - **Key Formulas / Facts** — bullets if applicable.
-   - **Common Pitfalls** — bullets if the document raises any.
+   - **Key Formulas / Facts** — at least 5 when applicable.
+   - **Common Pitfalls** — at least 3.
+   - **Quick Reference** — condensed lookup table.
+   - **Self-test Prompts** — 4-6 short questions answerable from these notes.
 
 LANGUAGE RULES:
 - All prose IN %s.
 - Keep technical terms in English even when writing %s ("machine learning", "ReLU", "p-value", "SQL", etc.).
 - Math/LaTeX stay as-is.
+
+DEPTH REQUIREMENTS:
+- Expand on the source — paraphrasing is not enough. Connect concepts where the document implies a link.
+- For every formula or rule, briefly explain WHY it's true or WHEN it applies.
+- Prefer specificity over generality: real numbers, concrete examples, named methods.
 
 CITATIONS — STRICT:
 1. The FIRST line of your output MUST be a single-line JSON block of the form:
@@ -288,49 +299,63 @@ CITATIONS — STRICT:
    - Emit this line EVEN IF you don't plan citations: <CITES>[]</CITES>
    - One entry per distinct [N] marker you will use.
    - "n" MUST equal the integer you put inside brackets in the markdown (e.g. [1] -> {"n":1,...}).
-   - "seg" is the 1-based block number from the numbered document below (the leading [N] on each line) that supports that claim.
+   - "seg" is the 1-based block number from the numbered document below.
 2. After the <CITES> line, output the markdown summary.
-3. Inside the markdown, append [N] markers after factual claims, definitions, examples, and formulas — anywhere a reader might want to jump back to the source. Reuse the same N across sentences where appropriate. Aim for 8-20 citations total; don't over-cite trivial words.
+3. Inside the markdown, append [N] markers after EVERY factual claim, definition, example, formula, and warning. Reuse the same N across sentences when grounded in the same block. Aim for 20-40 citations total.
 
 OUTPUT RULES:
-- Only include sections, tables, examples, and formulas the document actually supports. Do NOT invent content.
+- Only include sections, tables, examples, and formulas the document actually supports. Do NOT invent facts, but DO infer plausible pitfalls/prerequisites when the structure calls for them and the source supports the inference.
 - No preamble, no closing remarks. Just <CITES> followed by the markdown.`, targetLang, targetLang, targetLang)
 
 	log.Printf("[Bedrock] SummarizeDocument: %d blocks → %s", len(blocks), targetLang)
-	raw, err := b.invokeClaude(system, body, 4096)
+	raw, err := b.invokeClaude(system, body, 8192)
 	if err != nil {
 		return "", nil, err
 	}
 	summary, citations := parseDocumentChatCitations(raw, blocks)
+	if strings.TrimSpace(summary) == "" {
+		return "", nil, fmt.Errorf("model returned empty document summary (raw len=%d)", len(raw))
+	}
 	return summary, citations, nil
 }
 
-// GenerateDocumentQuiz creates 8 multiple-choice questions tuned for written
-// material (vs. spoken lectures).
+// GenerateDocumentQuiz creates 20 multiple-choice questions tuned for written
+// material (vs. spoken lectures), with a deliberate difficulty mix.
 func (b *BedrockService) GenerateDocumentQuiz(blocks []models.DocumentBlock, targetLang string) ([]models.QuizQuestion, error) {
 	body := joinBlocksPlain(blocks)
-	system := fmt.Sprintf(`You are an educational quiz generator. Create 8 multiple-choice questions IN %s based on the document below (slides, textbook chapter, paper, or reading).
-Test understanding of key concepts and the document's actual content, not surface trivia.
+	system := fmt.Sprintf(`You are an educational quiz generator. Create EXACTLY 20 multiple-choice questions IN %s based on the document below (slides, textbook chapter, paper, or reading). This is exam preparation — cover the document broadly and test real understanding.
 
 Return ONLY a JSON array, no markdown, no explanation. Format:
 [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"why this is correct"}]
 
-Rules:
+DIFFICULTY MIX (deliberate):
+- 6-8 RECALL questions: definitions, named methods, key facts directly stated.
+- 6-8 REASONING questions: compare/contrast, why-questions, identifying which property follows from which premise.
+- 4-6 APPLIED questions: "which scenario fits", "what would happen if", "given these numbers, which choice is correct".
+
+COVERAGE:
+- Spread questions across the WHOLE document, not just the first portion. Every major section should get 2-3 questions.
+- Each question targets a distinct learning objective — no duplicates.
+
+QUALITY RULES:
 - All text (question, options, explanation) IN %s.
 - Keep technical terms in English.
 - "correct" is the 0-indexed position of the right answer.
-- Make wrong options plausible but clearly wrong.
-- 4 options per question.
-- Prefer questions that test reasoning or application over rote recall when the document supports it.`, targetLang, targetLang)
+- 4 options per question. Wrong options must be PLAUSIBLE — common misconceptions or near-misses — but clearly wrong on careful reading. Never include obvious throwaways.
+- Rotate the correct-answer index so the right answer isn't always position 0; aim for roughly even spread across positions 0-3.
+- "explanation" is 1-2 sentences saying WHY the right answer is right and ideally why the most tempting wrong answer is wrong.`, targetLang, targetLang)
 
-	log.Printf("[Bedrock] GenerateDocumentQuiz: %d blocks → %s", len(blocks), targetLang)
-	raw, err := b.invokeClaude(system, body, 4096)
+	log.Printf("[Bedrock] GenerateDocumentQuiz: %d blocks → %s (target 20 questions)", len(blocks), targetLang)
+	raw, err := b.invokeClaude(system, body, 8192)
 	if err != nil {
 		return nil, err
 	}
 	var quiz []models.QuizQuestion
 	if err := json.Unmarshal([]byte(cleanJSON(raw)), &quiz); err != nil {
 		return nil, fmt.Errorf("parse document-quiz JSON: %w\nRaw: %s", err, raw)
+	}
+	if len(quiz) == 0 {
+		return nil, fmt.Errorf("model returned empty document quiz")
 	}
 	return quiz, nil
 }
@@ -359,6 +384,9 @@ Rules:
 	var vocab []models.VocabEntry
 	if err := json.Unmarshal([]byte(cleanJSON(raw)), &vocab); err != nil {
 		return nil, fmt.Errorf("parse document-vocab JSON: %w\nRaw: %s", err, raw)
+	}
+	if len(vocab) == 0 {
+		return nil, fmt.Errorf("model returned empty document vocab")
 	}
 	return vocab, nil
 }

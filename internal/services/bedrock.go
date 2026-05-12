@@ -633,31 +633,42 @@ func (b *BedrockService) Summarize(segments []TranscriptSegment, targetLang stri
 		fmt.Fprintf(&numbered, "[%d] (%s) %s\n", i+1, formatTS(seg.StartSeconds), seg.Text)
 	}
 
-	system := fmt.Sprintf(`You are an educational study assistant for university students. Produce polished, exam-prep-style study notes IN %s from the numbered lecture transcript below. Output MUST be GitHub-flavored markdown.
+	system := fmt.Sprintf(`You are an educational study assistant for university students. Produce comprehensive, exam-prep-style study notes IN %s from the numbered lecture transcript below. Output MUST be GitHub-flavored markdown. Target length 1500-2500 words — this is a study unit, not a description of one.
 
 STRUCTURE — follow this skeleton in order:
 
 1. A top-level "# <emoji> <Lecture Title>" heading, where the emoji reflects the topic (e.g. 📈 for stats, 🧠 for ML, 🔐 for security, 💾 for databases, 🌐 for networking).
-2. **Brief Overview** — 2-3 sentences describing what the lecture covers.
-3. **Key Points** — 3-5 bullets listing learning objectives.
-4. A horizontal rule (---).
-5. 4-8 main sections. Each section:
-   - Starts with a "## <emoji> <Section Title>" header.
-   - May contain "### <Subsection>" subheaders.
-   - Uses bulleted lists with *italicized* key terms inline.
-   - Uses "> <one-sentence definition>" blockquotes to define each core concept.
-   - Uses "> ⚠️ **Warning:** ..." blockquotes for common misconceptions raised in the transcript.
-   - Uses GFM tables for any side-by-side comparison.
-   - Uses inline math in $...$ and block math in $$...$$ for formulas.
-   - Includes an "**Example:**" subsection with concrete numbers when the transcript provides them.
+2. **Brief Overview** — 3-5 sentences describing what the lecture covers, the problem it addresses, and the level it pitches at.
+3. **Learning Objectives** — 5-7 bullets stating what a student should be able to do after studying these notes (use verbs like "explain", "compare", "derive", "apply").
+4. **Prerequisites** — 2-4 bullets listing concepts/terms a reader should already know before this lecture. Infer from context if not stated explicitly.
+5. A horizontal rule (---).
+6. 6-10 main sections (NOT 3-4 — expand the material). Each section MUST contain:
+   - "## <emoji> <Section Title>" header.
+   - A 2-3 sentence intro paragraph framing the section.
+   - At least one "### <Subsection>" subheader breaking the section into parts.
+   - Bulleted lists with *italicized* key terms inline.
+   - "> <one-sentence definition>" blockquotes for every core concept introduced (don't skip — define each term the first time it appears).
+   - "> ⚠️ **Warning:** ..." blockquotes for misconceptions, edge cases, or pitfalls.
+   - GFM tables for any side-by-side comparison, parameter list, or option matrix.
+   - Inline math in $...$ and block math in $$...$$ for any formula or relationship — including derivations or intermediate steps when the lecture walks through them.
+   - "**Example:**" subsection with concrete numbers when the transcript provides them. If the lecture gives no numbers but the topic supports it, add "**Worked scenario:**" with a plausible illustrative case grounded in what the lecturer said.
    - Separated by horizontal rules (---).
-6. Final section "## 🧠 Exam-Prep Checklist":
-   - **Quick Decision Thresholds**, **Must-Know Formulas / Facts**, **Common Pitfalls**, **Quick Reference**.
+7. Final section "## 🧠 Exam-Prep Checklist":
+   - **Quick Decision Thresholds** — when to use what.
+   - **Must-Know Formulas / Facts** — at least 5 items when applicable.
+   - **Common Pitfalls** — at least 3 items.
+   - **Quick Reference** — short lookup table or condensed cheat-sheet.
+   - **Self-test Prompts** — 4-6 short questions a student should be able to answer from these notes.
 
 LANGUAGE RULES:
 - All prose IN %s.
 - Keep technical terms in English even when writing %s ("machine learning", "ReLU", "p-value", "SQL", etc.).
 - Math/LaTeX stays as-is.
+
+DEPTH REQUIREMENTS:
+- Expand on the lecturer's points — paraphrasing alone is not enough. Connect concepts to each other where the lecturer implied a link.
+- For every formula or rule, briefly explain WHY it's true or WHEN it applies, not just what it says.
+- Prefer specificity over generality: real numbers, concrete examples, named methods.
 
 CITATIONS — STRICT:
 1. The FIRST line of your output MUST be a single-line JSON block of the form:
@@ -667,39 +678,52 @@ CITATIONS — STRICT:
    - "n" MUST equal the integer you put inside brackets in the markdown.
    - "seg" is the 1-based segment number from the numbered transcript below.
 2. After the <CITES> line, output the markdown summary.
-3. Inside the markdown, append [N] markers after factual claims, definitions, examples, and formulas. Reuse the same N across sentences. Aim for 8-20 citations total.
+3. Inside the markdown, append [N] markers after EVERY factual claim, definition, example, formula, and warning. Reuse the same N across sentences when grounded in the same segment. Aim for 20-40 citations total.
 
 OUTPUT RULES:
-- Only include sections, tables, warnings, and examples the transcript actually supports. Do NOT invent.
+- Only include sections, tables, warnings, and examples the transcript actually supports. Do NOT invent facts, but DO infer plausible pitfalls/prerequisites when the structure calls for them and the source supports the inference.
 - No preamble, no closing remarks. Just <CITES> followed by the markdown.`, targetLang, targetLang, targetLang)
 
 	log.Printf("[Bedrock] Summarize: %d segments → %s", len(segments), targetLang)
-	raw, err := b.invokeClaude(system, numbered.String(), 4096)
+	raw, err := b.invokeClaude(system, numbered.String(), 8192)
 	if err != nil {
 		return "", nil, err
 	}
 	summary, citations := parseChatCitations(raw, segments)
+	if strings.TrimSpace(summary) == "" {
+		return "", nil, fmt.Errorf("model returned empty summary (raw len=%d)", len(raw))
+	}
 	return summary, citations, nil
 }
 
-// GenerateQuiz creates 8 multiple-choice questions in the target language.
+// GenerateQuiz creates 20 multiple-choice questions in the target language,
+// spread across difficulty levels to support real exam prep.
 func (b *BedrockService) GenerateQuiz(segments []TranscriptSegment, targetLang string) ([]models.QuizQuestion, error) {
 	transcript := joinSegments(segments)
-	system := fmt.Sprintf(`You are an educational quiz generator. Create 8 multiple-choice questions IN %s based on the lecture transcript.
-Test understanding of key concepts, not trivia.
+	system := fmt.Sprintf(`You are an educational quiz generator. Create EXACTLY 20 multiple-choice questions IN %s based on the lecture transcript. This is exam preparation — cover the lecture broadly and test real understanding.
 
 Return ONLY a JSON array, no markdown, no explanation. Format:
 [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"why this is correct"}]
 
-Rules:
-- All text (question, options, explanation) in %s
-- Keep technical terms in English (e.g. "neural network", "ReLU")
-- "correct" is the 0-indexed position of the right answer
-- Make wrong options plausible but clearly wrong
-- 4 options per question`, targetLang, targetLang)
+DIFFICULTY MIX (deliberate, not random):
+- 6-8 RECALL questions: definitions, named methods, key facts directly stated in the lecture.
+- 6-8 REASONING questions: compare/contrast two concepts, why-questions, identifying which property follows from which premise.
+- 4-6 APPLIED questions: "which scenario fits", "what would happen if", "given these numbers, which choice is correct" — student must apply the concept to a new situation.
 
-	log.Printf("[Bedrock] GenerateQuiz: %d segments → %s", len(segments), targetLang)
-	raw, err := b.invokeClaude(system, transcript, 4096)
+COVERAGE:
+- Spread questions across the WHOLE lecture, not just the first portion. If the lecture covers 5 topics, every topic should get at least 2-3 questions.
+- Don't repeat the same concept twice — each question targets a distinct learning objective.
+
+QUALITY RULES:
+- All text (question, options, explanation) IN %s.
+- Keep technical terms in English (e.g. "neural network", "ReLU", "API", "p-value").
+- "correct" is the 0-indexed position of the right answer.
+- 4 options per question. Wrong options must be PLAUSIBLE — common misconceptions, near-misses, or facts from adjacent topics — but clearly wrong on careful reading. Never include obvious throwaways.
+- Rotate the correct-answer index so the right answer isn't always position 0; aim for roughly even spread across positions 0-3.
+- "explanation" is 1-2 sentences saying WHY the right answer is right and ideally why the most tempting wrong answer is wrong — not just restating the right option.`, targetLang, targetLang)
+
+	log.Printf("[Bedrock] GenerateQuiz: %d segments → %s (target 20 questions)", len(segments), targetLang)
+	raw, err := b.invokeClaude(system, transcript, 8192)
 	if err != nil {
 		return nil, err
 	}
@@ -708,6 +732,9 @@ Rules:
 	var quiz []models.QuizQuestion
 	if err := json.Unmarshal([]byte(cleaned), &quiz); err != nil {
 		return nil, fmt.Errorf("parse quiz JSON: %w\nRaw: %s", err, raw)
+	}
+	if len(quiz) == 0 {
+		return nil, fmt.Errorf("model returned empty quiz")
 	}
 	return quiz, nil
 }
@@ -737,6 +764,9 @@ Rules:
 	var vocab []models.VocabEntry
 	if err := json.Unmarshal([]byte(cleaned), &vocab); err != nil {
 		return nil, fmt.Errorf("parse vocab JSON: %w\nRaw: %s", err, raw)
+	}
+	if len(vocab) == 0 {
+		return nil, fmt.Errorf("model returned empty vocab")
 	}
 	return vocab, nil
 }

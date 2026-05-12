@@ -107,7 +107,9 @@ type summaryEnvelope struct {
 
 func decodeLectureSummary(cached string) summaryEnvelope {
 	var env summaryEnvelope
-	if json.Unmarshal([]byte(cached), &env) == nil && env.Summary != "" {
+	if err := json.Unmarshal([]byte(cached), &env); err == nil {
+		// Envelope shape matched (even if empty). An empty envelope means a
+		// prior generation failed and got cached — caller treats it as miss.
 		return env
 	}
 	// Legacy plain-text cache — surface as a citation-less envelope.
@@ -123,9 +125,12 @@ func (h *CourseHandler) Summarize(c *fiber.Ctx) error {
 	videoID := extractVideoID(req.VideoURL)
 
 	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "summary"); cached != "" {
-		log.Printf("[Handler] Summary cache HIT for %s/%s", videoID, req.TargetLang)
 		env := decodeLectureSummary(cached)
-		return c.JSON(fiber.Map{"summary": env.Summary, "citations": env.Citations, "from_cache": true})
+		if strings.TrimSpace(env.Summary) != "" {
+			log.Printf("[Handler] Summary cache HIT for %s/%s", videoID, req.TargetLang)
+			return c.JSON(fiber.Map{"summary": env.Summary, "citations": env.Citations, "from_cache": true})
+		}
+		log.Printf("[Handler] Summary cache had empty entry for %s/%s — regenerating", videoID, req.TargetLang)
 	}
 
 	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
@@ -139,8 +144,10 @@ func (h *CourseHandler) Summarize(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Summary generation failed"})
 	}
 
-	if data, jerr := json.Marshal(summaryEnvelope{Summary: summary, Citations: citations}); jerr == nil {
-		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "summary", string(data))
+	if strings.TrimSpace(summary) != "" {
+		if data, jerr := json.Marshal(summaryEnvelope{Summary: summary, Citations: citations}); jerr == nil {
+			go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "summary", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"summary": summary, "citations": citations, "from_cache": false})
 }
@@ -154,11 +161,12 @@ func (h *CourseHandler) GenerateQuiz(c *fiber.Ctx) error {
 	videoID := extractVideoID(req.VideoURL)
 
 	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "quiz"); cached != "" {
-		log.Printf("[Handler] Quiz cache HIT for %s/%s", videoID, req.TargetLang)
 		var quiz []models.QuizQuestion
-		if err := json.Unmarshal([]byte(cached), &quiz); err == nil {
+		if err := json.Unmarshal([]byte(cached), &quiz); err == nil && len(quiz) > 0 {
+			log.Printf("[Handler] Quiz cache HIT for %s/%s", videoID, req.TargetLang)
 			return c.JSON(fiber.Map{"quiz": quiz, "from_cache": true})
 		}
+		log.Printf("[Handler] Quiz cache empty/invalid for %s/%s — regenerating", videoID, req.TargetLang)
 	}
 
 	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
@@ -172,8 +180,10 @@ func (h *CourseHandler) GenerateQuiz(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Quiz generation failed"})
 	}
 
-	if data, err := json.Marshal(quiz); err == nil {
-		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "quiz", string(data))
+	if len(quiz) > 0 {
+		if data, err := json.Marshal(quiz); err == nil {
+			go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "quiz", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"quiz": quiz, "from_cache": false})
 }
@@ -187,11 +197,12 @@ func (h *CourseHandler) ExtractVocab(c *fiber.Ctx) error {
 	videoID := extractVideoID(req.VideoURL)
 
 	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "vocab"); cached != "" {
-		log.Printf("[Handler] Vocab cache HIT for %s/%s", videoID, req.TargetLang)
 		var vocab []models.VocabEntry
-		if err := json.Unmarshal([]byte(cached), &vocab); err == nil {
+		if err := json.Unmarshal([]byte(cached), &vocab); err == nil && len(vocab) > 0 {
+			log.Printf("[Handler] Vocab cache HIT for %s/%s", videoID, req.TargetLang)
 			return c.JSON(fiber.Map{"vocab": vocab, "from_cache": true})
 		}
+		log.Printf("[Handler] Vocab cache empty/invalid for %s/%s — regenerating", videoID, req.TargetLang)
 	}
 
 	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
@@ -205,8 +216,10 @@ func (h *CourseHandler) ExtractVocab(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Vocab generation failed"})
 	}
 
-	if data, err := json.Marshal(vocab); err == nil {
-		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "vocab", string(data))
+	if len(vocab) > 0 {
+		if data, err := json.Marshal(vocab); err == nil {
+			go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "vocab", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"vocab": vocab, "from_cache": false})
 }
@@ -432,6 +445,10 @@ func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs 
 			log.Printf("[Handler] auto-summary error: %v", err)
 			return
 		}
+		if strings.TrimSpace(summary) == "" {
+			log.Printf("[Handler] auto-summary returned empty — skipping cache")
+			return
+		}
 		data, jerr := json.Marshal(summaryEnvelope{Summary: summary, Citations: citations})
 		if jerr != nil {
 			log.Printf("[Handler] auto-summary marshal error: %v", jerr)
@@ -449,6 +466,10 @@ func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs 
 			log.Printf("[Handler] auto-quiz error: %v", err)
 			return
 		}
+		if len(quiz) == 0 {
+			log.Printf("[Handler] auto-quiz returned empty — skipping cache")
+			return
+		}
 		raw, _ := json.Marshal(quiz)
 		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "quiz", string(raw)); err != nil {
 			log.Printf("[Handler] auto-quiz cache error: %v", err)
@@ -462,6 +483,10 @@ func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs 
 			log.Printf("[Handler] auto-vocab error: %v", err)
 			return
 		}
+		if len(vocab) == 0 {
+			log.Printf("[Handler] auto-vocab returned empty — skipping cache")
+			return
+		}
 		raw, _ := json.Marshal(vocab)
 		if err := h.cache.SaveStudyMaterial(videoID, targetLang, "vocab", string(raw)); err != nil {
 			log.Printf("[Handler] auto-vocab cache error: %v", err)
@@ -473,6 +498,10 @@ func (h *CourseHandler) generateStudyMaterials(videoID, targetLang string, segs 
 		lessons, err := h.bedrock.GenerateLectureLesson(segs, targetLang)
 		if err != nil {
 			log.Printf("[Handler] auto-lesson error: %v", err)
+			return
+		}
+		if len(lessons) == 0 {
+			log.Printf("[Handler] auto-lesson returned empty — skipping cache")
 			return
 		}
 		raw, _ := json.Marshal(lessons)
@@ -599,9 +628,10 @@ func (h *CourseHandler) GenerateLesson(c *fiber.Ctx) error {
 
 	if cached, _ := h.cache.GetStudyMaterial(videoID, req.TargetLang, "lesson"); cached != "" {
 		var lessons []services.LectureLesson
-		if err := json.Unmarshal([]byte(cached), &lessons); err == nil {
+		if err := json.Unmarshal([]byte(cached), &lessons); err == nil && len(lessons) > 0 {
 			return c.JSON(fiber.Map{"lessons": lessons, "from_cache": true})
 		}
+		log.Printf("[Handler] Lesson cache empty/invalid for %s/%s — regenerating", videoID, req.TargetLang)
 	}
 
 	segs, err := h.loadCachedSegments(req.VideoURL, req.TargetLang)
@@ -616,8 +646,10 @@ func (h *CourseHandler) GenerateLesson(c *fiber.Ctx) error {
 			"error": "Lesson generation failed: " + err.Error(),
 		})
 	}
-	if data, jerr := json.Marshal(lessons); jerr == nil {
-		go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "lesson", string(data))
+	if len(lessons) > 0 {
+		if data, jerr := json.Marshal(lessons); jerr == nil {
+			go h.cache.SaveStudyMaterial(videoID, req.TargetLang, "lesson", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"lessons": lessons, "from_cache": false})
 }

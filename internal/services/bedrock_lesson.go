@@ -29,7 +29,7 @@ import (
 //
 // Concurrency is capped at 3 to avoid Bedrock RPM throttling.
 
-const lessonContentMaxTokens = 4096
+const lessonContentMaxTokens = 8192
 const lessonOutlineMaxTokens = 2048
 
 // lessonChapterConcurrency = 3. Earlier serial setting was a stopgap before
@@ -88,7 +88,7 @@ type lessonCiteRaw struct {
 
 // identifyLessonChapters runs the small "where do chapters begin" pass.
 func (b *BedrockService) identifyLessonChapters(numbered, sourceKind, targetLang string) ([]chapterOutline, error) {
-	system := fmt.Sprintf(`Identify 3-5 sequential chapters in the numbered %s below. Each chapter begins at a specific 1-based segment/block number.
+	system := fmt.Sprintf(`Identify 5-7 sequential chapters in the numbered %s below. Each chapter begins at a specific 1-based segment/block number.
 
 Return ONLY a JSON array of chapter objects — no markdown fences, no preamble. Each chapter:
 - "start_seg": 1-based number where the chapter BEGINS.
@@ -98,9 +98,9 @@ Return ONLY a JSON array of chapter objects — no markdown fences, no preamble.
 RULES:
 - First chapter MUST start at 1.
 - Sequential, non-overlapping.
-- 3 minimum, 5 maximum.
-- Each chapter MUST span enough source material to support a 300-500 word summary plus 4-5 quiz questions. Prefer FEWER, LONGER chapters over many tiny ones — a chapter covering 30 seconds of lecture is too short. Aim for at least 15-30 segments / blocks per chapter.
-- Match how the material is actually structured — don't slice arbitrarily.`, sourceKind, targetLang)
+- 5 minimum, 7 maximum.
+- Each chapter MUST span enough source material to support a 500-900 word summary plus 6-8 quiz questions. A chapter covering 30 seconds of lecture is too short. Aim for at least 20-40 segments / blocks per chapter.
+- Match how the material is actually structured — find the natural topical breaks the instructor / author used.`, sourceKind, targetLang)
 
 	raw, err := b.invokeClaudeLong("identifyLessonChapters", system, numbered, lessonOutlineMaxTokens)
 	if err != nil {
@@ -130,32 +130,35 @@ Return ONLY a single JSON object — NOT an array, NOT inside markdown fences, n
 }
 
 Where:
-- "summary": GitHub-flavored markdown, 300-600 words. The summary MUST include ALL of these sections in this order, each as its own heading or labeled block — do NOT collapse the chapter into one flowing paragraph:
+- "summary": GitHub-flavored markdown, 500-900 words. The summary MUST include ALL of these sections in this order, each as its own heading or labeled block — do NOT collapse the chapter into one flowing paragraph:
 
     ### Overview
-    A 3-5 sentence opening that frames what this chapter teaches and why it matters in context. Make it specific to this chapter, not generic.
+    A 4-6 sentence opening that frames what this chapter teaches, why it matters in context, and how it connects to surrounding chapters. Make it specific, not generic.
 
     ### Key concepts
-    A bulleted list of 4-7 items. Each bullet is a complete sentence explaining ONE idea — not just a noun phrase. Include the most important takeaways from this chapter.
+    A bulleted list of 5-8 items. Each bullet is a complete sentence (sometimes 2) explaining ONE idea — not just a noun phrase. Cover the most important takeaways from this chapter.
 
     ### Definitions
-    Use > blockquotes for each core term introduced in this chapter. One term = one one-sentence definition. Include at least 2 definitions when the source supports terminology; if the chapter is conceptual without named terms, use blockquotes for 2-3 short principle-statements instead. Never skip this section entirely.
+    Use > blockquotes for each core term introduced. One term = one one-sentence definition. Include at least 3 definitions when the source supports terminology; if the chapter is conceptual without named terms, use blockquotes for 3-4 short principle-statements instead. Never skip this section.
 
-    ### Worked example  ← REQUIRED if the source has any numbers, scenarios, comparisons, or step-by-step content. Reproduce the example with concrete details. If the source genuinely has no example, replace this section with **Practical context** explaining a realistic scenario where the chapter's ideas apply.
+    ### Detailed explanation
+    A 2-4 paragraph deep-dive on the chapter's central mechanism, theorem, process, or argument. Walk through HOW the concept works step by step. Reference formulas, named methods, or specific values from the source. This is the chapter's main body of substance — do not skimp.
+
+    ### Worked example  ← REQUIRED if the source has any numbers, scenarios, comparisons, or step-by-step content. Reproduce the example with concrete details and intermediate steps. If the source genuinely has no example, replace this section with **Practical context** explaining a realistic scenario where the chapter's ideas apply.
 
     ### Common pitfalls
-    1-3 short bullets covering misconceptions, edge cases, or things students typically get wrong. If the lecturer/document doesn't explicitly flag pitfalls, INFER plausible ones from the material. Always include this section.
+    2-4 short bullets covering misconceptions, edge cases, or things students typically get wrong. If the source doesn't explicitly flag pitfalls, INFER plausible ones from the material. Always include this section.
 
-    Use inline math in $...$ and block math in $$...$$ wherever the source mentions formulas, ratios, or numeric relationships.
-    Append [N] markers throughout — after every factual claim, every definition, every example, every formula. Aim for 8-15 distinct markers per chapter.
+    Use inline math in $...$ and block math in $$...$$ wherever the source mentions formulas, ratios, or numeric relationships. For every formula, briefly state WHEN it applies or WHY it holds.
+    Append [N] markers throughout — after every factual claim, every definition, every example step, every formula, every pitfall. Aim for 15-25 distinct markers per chapter.
 
 - "summary_cites": JSON array of {"n":1,"seg":42} entries — one per distinct [N] you used. Emit [] if you used none. "seg" is the 1-based number from the chapter's numbered %s below.
 
-- "quiz": EXACTLY 4 to 5 multiple-choice questions IN %s about THIS chapter only — never fewer than 4. Format: [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"..."}]. Mix difficulty deliberately:
-    * 1-2 recall questions (definitions, facts).
-    * 1-2 reasoning questions (compare/contrast, why-questions).
-    * 1 applied question (which scenario fits, what would happen if).
-  Each question has 4 options. Wrong options must be plausible but clearly wrong on close reading. "explanation" is 1-2 sentences saying WHY the right answer is right (not just restating it). "correct" is 0-indexed. Keep technical terms in English.
+- "quiz": EXACTLY 6 to 8 multiple-choice questions IN %s about THIS chapter only — never fewer than 6. Format: [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"..."}]. Mix difficulty deliberately:
+    * 2-3 recall questions (definitions, named facts directly from the chapter).
+    * 2-3 reasoning questions (compare/contrast, why-questions, identifying which property follows from which premise).
+    * 2 applied questions (which scenario fits, what would happen if, given these numbers which choice is correct).
+  Each question has 4 options. Wrong options must be plausible (common misconceptions or near-misses) but clearly wrong on close reading. Rotate the correct-answer index across positions 0-3 — don't always put it at 0. "explanation" is 1-2 sentences saying WHY the right answer is right and ideally why the most tempting wrong answer is wrong. "correct" is 0-indexed. Keep technical terms in English.
 
 LANGUAGE: All prose IN %s. Technical terms in English ("ReLU", "p-value", "API", "SQL", proper nouns). Math/LaTeX as-is.
 

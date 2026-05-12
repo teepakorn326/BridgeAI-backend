@@ -177,7 +177,9 @@ type documentSummaryEnvelope struct {
 
 func decodeDocumentSummary(cached string) documentSummaryEnvelope {
 	var env documentSummaryEnvelope
-	if json.Unmarshal([]byte(cached), &env) == nil && env.Summary != "" {
+	if err := json.Unmarshal([]byte(cached), &env); err == nil {
+		// Envelope shape matched (even if empty). An empty envelope means a
+		// prior generation failed and got cached — caller treats it as miss.
 		return env
 	}
 	return documentSummaryEnvelope{Summary: cached}
@@ -191,15 +193,20 @@ func (h *DocumentHandler) SummarizeDocument(c *fiber.Ctx) error {
 	}
 	if cached, _ := h.cache.GetDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "summary"); cached != "" {
 		env := decodeDocumentSummary(cached)
-		return c.JSON(fiber.Map{"summary": env.Summary, "citations": env.Citations, "from_cache": true})
+		if strings.TrimSpace(env.Summary) != "" {
+			return c.JSON(fiber.Map{"summary": env.Summary, "citations": env.Citations, "from_cache": true})
+		}
+		log.Printf("[Document] Summary cache empty for %s/%s — regenerating", doc.DocumentID, doc.TargetLang)
 	}
 	summary, citations, err := h.bedrock.SummarizeDocument(doc.Blocks, doc.TargetLang)
 	if err != nil {
 		log.Printf("[Document] Summarize error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Summary generation failed"})
 	}
-	if data, jerr := json.Marshal(documentSummaryEnvelope{Summary: summary, Citations: citations}); jerr == nil {
-		go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "summary", string(data))
+	if strings.TrimSpace(summary) != "" {
+		if data, jerr := json.Marshal(documentSummaryEnvelope{Summary: summary, Citations: citations}); jerr == nil {
+			go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "summary", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"summary": summary, "citations": citations, "from_cache": false})
 }
@@ -212,17 +219,20 @@ func (h *DocumentHandler) GenerateDocumentQuiz(c *fiber.Ctx) error {
 	}
 	if cached, _ := h.cache.GetDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "quiz"); cached != "" {
 		var quiz []models.QuizQuestion
-		if jerr := json.Unmarshal([]byte(cached), &quiz); jerr == nil {
+		if jerr := json.Unmarshal([]byte(cached), &quiz); jerr == nil && len(quiz) > 0 {
 			return c.JSON(fiber.Map{"quiz": quiz, "from_cache": true})
 		}
+		log.Printf("[Document] Quiz cache empty/invalid for %s/%s — regenerating", doc.DocumentID, doc.TargetLang)
 	}
 	quiz, err := h.bedrock.GenerateDocumentQuiz(doc.Blocks, doc.TargetLang)
 	if err != nil {
 		log.Printf("[Document] Quiz error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Quiz generation failed"})
 	}
-	if data, jerr := json.Marshal(quiz); jerr == nil {
-		go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "quiz", string(data))
+	if len(quiz) > 0 {
+		if data, jerr := json.Marshal(quiz); jerr == nil {
+			go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "quiz", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"quiz": quiz, "from_cache": false})
 }
@@ -235,17 +245,20 @@ func (h *DocumentHandler) ExtractDocumentVocab(c *fiber.Ctx) error {
 	}
 	if cached, _ := h.cache.GetDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "vocab"); cached != "" {
 		var vocab []models.VocabEntry
-		if jerr := json.Unmarshal([]byte(cached), &vocab); jerr == nil {
+		if jerr := json.Unmarshal([]byte(cached), &vocab); jerr == nil && len(vocab) > 0 {
 			return c.JSON(fiber.Map{"vocab": vocab, "from_cache": true})
 		}
+		log.Printf("[Document] Vocab cache empty/invalid for %s/%s — regenerating", doc.DocumentID, doc.TargetLang)
 	}
 	vocab, err := h.bedrock.ExtractDocumentVocab(doc.Blocks, doc.TargetLang)
 	if err != nil {
 		log.Printf("[Document] Vocab error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Vocab generation failed"})
 	}
-	if data, jerr := json.Marshal(vocab); jerr == nil {
-		go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "vocab", string(data))
+	if len(vocab) > 0 {
+		if data, jerr := json.Marshal(vocab); jerr == nil {
+			go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "vocab", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"vocab": vocab, "from_cache": false})
 }
@@ -259,9 +272,10 @@ func (h *DocumentHandler) GenerateDocumentLesson(c *fiber.Ctx) error {
 	}
 	if cached, _ := h.cache.GetDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "lesson"); cached != "" {
 		var lessons []models.DocumentLesson
-		if err := json.Unmarshal([]byte(cached), &lessons); err == nil {
+		if err := json.Unmarshal([]byte(cached), &lessons); err == nil && len(lessons) > 0 {
 			return c.JSON(fiber.Map{"lessons": lessons, "from_cache": true})
 		}
+		log.Printf("[Document] Lesson cache empty/invalid for %s/%s — regenerating", doc.DocumentID, doc.TargetLang)
 	}
 	lessons, err := h.bedrock.GenerateDocumentLesson(doc.Blocks, doc.TargetLang)
 	if err != nil {
@@ -270,8 +284,10 @@ func (h *DocumentHandler) GenerateDocumentLesson(c *fiber.Ctx) error {
 			"error": "Lesson generation failed: " + err.Error(),
 		})
 	}
-	if data, jerr := json.Marshal(lessons); jerr == nil {
-		go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "lesson", string(data))
+	if len(lessons) > 0 {
+		if data, jerr := json.Marshal(lessons); jerr == nil {
+			go h.cache.SaveDocumentStudyMaterial(doc.DocumentID, doc.TargetLang, "lesson", string(data))
+		}
 	}
 	return c.JSON(fiber.Map{"lessons": lessons, "from_cache": false})
 }
@@ -342,6 +358,10 @@ func (h *DocumentHandler) generateDocumentStudyMaterials(documentID, targetLang 
 			log.Printf("[Document] auto-summary error: %v", err)
 			return
 		}
+		if strings.TrimSpace(summary) == "" {
+			log.Printf("[Document] auto-summary returned empty — skipping cache")
+			return
+		}
 		data, jerr := json.Marshal(documentSummaryEnvelope{Summary: summary, Citations: citations})
 		if jerr != nil {
 			log.Printf("[Document] auto-summary marshal error: %v", jerr)
@@ -359,6 +379,10 @@ func (h *DocumentHandler) generateDocumentStudyMaterials(documentID, targetLang 
 			log.Printf("[Document] auto-quiz error: %v", err)
 			return
 		}
+		if len(quiz) == 0 {
+			log.Printf("[Document] auto-quiz returned empty — skipping cache")
+			return
+		}
 		raw, _ := json.Marshal(quiz)
 		if err := h.cache.SaveDocumentStudyMaterial(documentID, targetLang, "quiz", string(raw)); err != nil {
 			log.Printf("[Document] auto-quiz cache error: %v", err)
@@ -372,6 +396,10 @@ func (h *DocumentHandler) generateDocumentStudyMaterials(documentID, targetLang 
 			log.Printf("[Document] auto-vocab error: %v", err)
 			return
 		}
+		if len(vocab) == 0 {
+			log.Printf("[Document] auto-vocab returned empty — skipping cache")
+			return
+		}
 		raw, _ := json.Marshal(vocab)
 		if err := h.cache.SaveDocumentStudyMaterial(documentID, targetLang, "vocab", string(raw)); err != nil {
 			log.Printf("[Document] auto-vocab cache error: %v", err)
@@ -383,6 +411,10 @@ func (h *DocumentHandler) generateDocumentStudyMaterials(documentID, targetLang 
 		lessons, err := h.bedrock.GenerateDocumentLesson(blocks, targetLang)
 		if err != nil {
 			log.Printf("[Document] auto-lesson error: %v", err)
+			return
+		}
+		if len(lessons) == 0 {
+			log.Printf("[Document] auto-lesson returned empty — skipping cache")
 			return
 		}
 		raw, _ := json.Marshal(lessons)
